@@ -12,6 +12,7 @@ Every function is pure: plain scalars and arrays in, plain values out. No databa
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -225,51 +226,69 @@ def fit_anytime_td(lam: float) -> Distribution:
 
 def fit_longest(
     n_plays: float,
-    explosive_rate: float,
-    yards_mean: float,
-    yards_scale: float,
+    play_gains: Sequence[float] | None = None,
+    explosive_rate: float = 0.1,
+    yards_mean: float = 8.0,
+    yards_scale: float = 10.0,
     n_sims: int = 2000,
     seed: int = 0,
 ) -> Distribution:
     """Distribution of the longest single play, by Monte Carlo (§5.6).
 
-    Simulates ``n_plays`` opportunities per trial. Each play gains yards drawn from an exponential
-    tail scaled to the player's per-play average, and the trial's outcome is the maximum.
+    Simulates ``Poisson(n_plays)`` opportunities per trial and takes the maximum gain.
+
+    **Gains are bootstrapped from the player's own plays** when ``play_gains`` is supplied. That
+    matters more than it sounds: a parametric tail has to be told how fat to be, and getting it
+    wrong is not subtle. An exponential mixture calibrated only on a mean and an observed maximum
+    put a quarterback's median longest completion at 75 yards, which is roughly the record for a
+    good season rather than a typical Sunday. Real completion gains are heavily concentrated in
+    the 4-15 yard range with a thin tail, and resampling them reproduces that shape exactly.
+
+    The parametric mixture remains as the fallback for a player with no play history.
 
     The point mass at zero is the settlement rule, not a modelling convenience: a longest-X prop
-    **settles Under when the player records no such play** (D9). So a trial that draws zero plays
-    contributes an outcome of 0, and ``p_zero`` is reported in the params.
+    **settles Under when the player records no such play** (D9), so a trial that draws zero
+    opportunities contributes an outcome of 0 and ``p_zero`` is reported in the params.
 
     Args:
-        n_plays: expected opportunities (targets, carries, or attempts).
-        explosive_rate: share of plays that go 15+ yards. Widens the tail.
-        yards_mean: mean yards per play for this player.
-        yards_scale: scale of the exponential tail; larger means a longer tail.
+        n_plays: expected opportunities (completions, catches, carries or made kicks).
+        play_gains: the player's observed per-play gains. Preferred over the parametric path.
+        explosive_rate: fallback only -- share of plays that go long.
+        yards_mean: fallback only -- mean yards per play.
+        yards_scale: fallback only -- scale of the exponential tail.
         n_sims: Monte Carlo draws. 2000 is plenty for quartiles (§5.6).
         seed: fixed so a projection is reproducible ("Show math", §1 point 4).
     """
     rng = np.random.default_rng(seed)
     n_plays = max(float(n_plays), 0.0)
-    yards_mean = max(float(yards_mean), 0.1)
-    yards_scale = max(float(yards_scale), 0.1)
 
     counts = rng.poisson(n_plays, size=n_sims)
     maxima = np.zeros(n_sims, dtype=float)
-
-    # One flat draw for every simulated play across all trials, then segment by trial.
     total = int(counts.sum())
+
+    gains = np.asarray(play_gains, dtype=float) if play_gains is not None else None
+    bootstrapped = gains is not None and gains.size >= 8
+
     if total > 0:
-        # Mixture: routine plays around the mean, explosive plays from a heavier tail.
-        is_explosive = rng.random(total) < np.clip(explosive_rate, 0.0, 1.0)
-        routine = rng.exponential(yards_mean, size=total)
-        explosive = yards_mean + rng.exponential(yards_scale * 2.0, size=total)
-        draws = np.where(is_explosive, explosive, routine)
+        if bootstrapped:
+            draws = rng.choice(gains, size=total, replace=True)
+        else:
+            yards_mean = max(float(yards_mean), 0.1)
+            yards_scale = max(float(yards_scale), 0.1)
+            is_explosive = rng.random(total) < np.clip(explosive_rate, 0.0, 1.0)
+            routine = rng.exponential(yards_mean, size=total)
+            explosive = yards_mean + rng.exponential(yards_scale, size=total)
+            draws = np.where(is_explosive, explosive, routine)
 
         offsets = np.concatenate([[0], np.cumsum(counts)])
         for i in range(n_sims):
             lo, hi = offsets[i], offsets[i + 1]
             if hi > lo:
                 maxima[i] = draws[lo:hi].max()
+
+    # A longest-X prop cannot settle negative: a loss on the only carry settles at that loss, but
+    # the market treats the floor as 0 for a player with no qualifying play.
+    maxima = np.maximum(maxima, 0.0)
 
     p_zero = float((counts == 0).mean())
     qs = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
@@ -281,16 +300,19 @@ def fit_longest(
             "quantiles": quantiles,
             "p_zero": p_zero,
             "n_plays": n_plays,
+            "bootstrapped": bootstrapped,
+            "n_observed_plays": int(gains.size) if gains is not None else 0,
             "explosive_rate": float(explosive_rate),
-            "yards_mean": yards_mean,
-            "yards_scale": yards_scale,
             "n_sims": n_sims,
             "seed": seed,
             "samples_sorted": _thin(maxima, 200),
         },
         mean=float(maxima.mean()),
         integer_valued=False,
-        notes=("settles Under if the player records no such play",),
+        notes=(
+            "settles Under if the player records no such play",
+            "bootstrapped from observed plays" if bootstrapped else "parametric fallback",
+        ),
     )
 
 

@@ -87,10 +87,15 @@ def backfill(seasons: list[int] | None = None, force: bool = False) -> list[Stag
     from backend.models.adjust import calibrate_metrics, compute_unit_facts
     from backend.models.gamelog import build_all as build_gamelogs
 
+    from backend.models.environment import fit_environment_models
+    from backend.models.injury import compute_play_rates
+
     stages += [
         _run("gamelog.build", build_gamelogs, seasons),
         _run("defense.facts", compute_unit_facts, seasons),
         _run("defense.calibrate", lambda: calibrate_metrics(seasons).height),
+        _run("environment.fit", lambda: len(fit_environment_models(seasons))),
+        _run("injury.play_rates", lambda: compute_play_rates(seasons).height),
     ]
     return stages
 

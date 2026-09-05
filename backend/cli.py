@@ -217,11 +217,33 @@ def project(
         print_projection(player, season, week)
 
 
+@app.command(name="calibrate-dispersion")
+def calibrate_dispersion_cmd(
+    season: Annotated[int, typer.Option(help="Season to FIT on; use a different one to report")] = 2024,
+    weeks: Annotated[str, typer.Option()] = "5-18",
+) -> None:
+    """Fit the p25–p75 width per stat on a training season (§6)."""
+    from backend.models.backtest import calibrate_dispersion
+
+    lo, hi = (int(x) for x in weeks.split("-", 1)) if "-" in weeks else (int(weeks), int(weeks))
+    frame = calibrate_dispersion(season, list(range(lo, hi + 1)))
+    if frame.is_empty():
+        console.print("[yellow]nothing to calibrate[/yellow]")
+        return
+    table = Table("position", "stat", "scale", "n", "coverage before", "coverage after",
+                  title=f"Dispersion calibration (fitted on {season} weeks {lo}-{hi})")
+    for r in frame.to_dicts():
+        table.add_row(r["position"], r["stat"], f"{r['scale']:.2f}", str(r["n"]),
+                      f"{r['coverage_before']:.1%}", f"{r['coverage_after']:.1%}")
+    console.print(table)
+
+
 @app.command()
 def backtest(
     season: Annotated[int, typer.Option()] = 2025,
     weeks: Annotated[str, typer.Option(help="Range like 5-18, or a single week")] = "5-18",
     positions: Annotated[str, typer.Option(help="Comma-separated; empty = all")] = "",
+    refit: Annotated[bool, typer.Option(help="Refit hyperparameters on prior seasons only")] = True,
 ) -> None:
     """Score projections against actuals and print the calibration table (§6)."""
     from backend.models.backtest import run_backtest
@@ -232,7 +254,7 @@ def backtest(
     else:
         week_list = [int(weeks)]
     pos = [p.strip().upper() for p in positions.split(",") if p.strip()] or None
-    run_backtest(season=season, weeks=week_list, positions=pos)
+    run_backtest(season=season, weeks=week_list, positions=pos, refit=refit)
 
 
 # ---------------------------------------------------------------------------

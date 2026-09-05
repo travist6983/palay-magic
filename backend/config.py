@@ -45,7 +45,28 @@ class Settings(BaseSettings):
 
     # --- model knobs (§5) --------------------------------------------------
     recency_window: int = 6
-    """N games in the recency-weighted baseline (§5.1)."""
+    """N games in the recency-weighted USAGE baseline (§5.1). Role changes fast."""
+
+    efficiency_window: int = 17
+    """N games for per-opportunity EFFICIENCY rates (yards per carry, catch rate, ...).
+
+    §5.1 sets one window of 6 for everything. That is right for usage, where a role change is the
+    signal, and wrong for efficiency, where it is mostly noise: Jahmyr Gibbs' last six games of
+    2025 ran 3.09 yards per carry against a career mark near 5.0, and projecting 3.09 forward
+    treats a bad stretch as a new true rate. Efficiency gets a longer window and is shrunk toward
+    the positional rate on top (see `efficiency_prior_games`).
+    """
+
+    efficiency_prior_games: float = 3.0
+    """Games of positional-average pseudo-data mixed into every efficiency rate.
+
+    Expressed in GAMES rather than opportunities on purpose. The weighted opportunity total that
+    a rate is computed over is much smaller than the raw count -- recency weights decay to well
+    under 1 -- so a prior stated in raw opportunities silently dominated: 60 pseudo-targets against
+    a running back's ~15 weighted targets gave the league average 80% of the weight and projected
+    him for 3.7 yards a catch. Scaling the prior by the player's own per-game volume keeps its
+    influence at the intended few games regardless of position.
+    """
 
     recency_decay: float = 0.8
     """w_i = decay ** i, most recent game i=0 (§5.1)."""

@@ -964,7 +964,9 @@ def build_adjusted_game_logs(
     from backend.models.stats import STAT_SPECS
 
     settings = get_settings()
-    lookback = settings.recency_window if lookback is None else lookback
+    # Store the longer of the two windows: usage baselines take the most recent 6 rows out of it,
+    # efficiency rates use the whole thing (config.efficiency_window).
+    lookback = max(settings.recency_window, settings.efficiency_window) if lookback is None else lookback
 
     # (position, stat) -> the defensive metric that adjusts it, from the canonical registry.
     mapping = pl.DataFrame(
