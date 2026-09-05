@@ -30,6 +30,13 @@ project: ## Project one player: make project PLAYER="Player Name"
 backtest: ## Score last season's projections against actuals
 	$(UV) run proplab backtest --season 2025 --weeks 5-18
 
+calibrate: ## Re-tune the opponent-adjustment model and the projection interval widths
+	$(UV) run proplab calibrate
+	$(UV) run proplab calibrate-dispersion --season 2024 --weeks 5-18
+
+notes: ## Generate the week's LLM narratives (needs ANTHROPIC_API_KEY)
+	$(UV) run proplab notes
+
 counts: ## SELECT count(*) from every table and view
 	$(UV) run proplab counts
 
@@ -41,6 +48,7 @@ web: ## Run the Vite frontend alone (http://localhost:5173)
 
 dev: ## Run backend + frontend together (http://localhost:5173)
 	@echo "backend -> http://127.0.0.1:8000   frontend -> http://localhost:5173"
+	@test -f data/proplab-serve.duckdb || $(UV) run proplab publish
 	@trap 'kill 0' EXIT INT TERM; \
 	$(UV) run uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000 & \
 	(cd frontend && npm run dev) & \

@@ -28,6 +28,16 @@ class Settings(BaseSettings):
 
     # --- paths -------------------------------------------------------------
     db_path: Path = Field(default=REPO_ROOT / "data" / "proplab.duckdb")
+
+    serve_db_path: Path = Field(default=REPO_ROOT / "data" / "proplab-serve.duckdb")
+    """Read-only snapshot the API serves from.
+
+    DuckDB locks the database file per process, and a read-only reader still blocks a writer, so an
+    API process holding the main file would make `make refresh` fail outright -- which is exactly
+    what `make dev` does. The refresh publishes a copy when it finishes and the API reads that, so
+    the two never contend and the UI always sees a consistent snapshot rather than a half-written
+    week.
+    """
     raw_dir: Path = Field(default=REPO_ROOT / "data" / "raw")
     cache_dir: Path = Field(default=REPO_ROOT / "data" / "cache")
 

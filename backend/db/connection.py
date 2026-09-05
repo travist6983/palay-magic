@@ -7,9 +7,11 @@ only ever reads.
 
 from __future__ import annotations
 
+import os
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -22,22 +24,83 @@ log = get_logger(__name__)
 
 _singleton: duckdb.DuckDBPyConnection | None = None
 _lock = threading.Lock()
+_read_only = False
+_serve_snapshot = False
 
 
 @contextmanager
 def connect(read_only: bool = False) -> Iterator[duckdb.DuckDBPyConnection]:
     """Open a DuckDB connection to the PropLab database and close it afterwards.
 
+    In a process that has called :func:`set_read_only` -- the API -- every connection is forced
+    read-only, including ones a shared helper opens for itself. DuckDB refuses to hold two
+    connections to one file with different configurations, so honouring the process-wide flag here
+    is what lets read-only query helpers live in modules that also write.
+
     Args:
         read_only: open without acquiring the write lock. Fails if the file does not exist yet.
     """
     settings = get_settings()
     settings.ensure_dirs()
-    con = duckdb.connect(str(settings.db_path), read_only=read_only)
+    con = duckdb.connect(str(active_db_path()), read_only=read_only or _read_only)
     try:
         yield con
     finally:
         con.close()
+
+
+def use_serve_snapshot(value: bool = True) -> None:
+    """Read from the published snapshot instead of the live database.
+
+    The API calls this at startup so a refresh can run underneath it (see
+    ``Settings.serve_db_path``). Falls back to the live file when no snapshot exists yet.
+    """
+    global _serve_snapshot
+    close_connection()
+    _serve_snapshot = value
+
+
+def active_db_path():
+    """Which database file this process is using."""
+    settings = get_settings()
+    if _serve_snapshot and settings.serve_db_path.exists():
+        return settings.serve_db_path
+    return settings.db_path
+
+
+def publish_snapshot() -> Path | None:
+    """Copy the live database to the serve path, atomically.
+
+    Called at the end of a refresh. The API picks the new file up on its next connection, so a
+    running app updates without a restart and never observes a partially written week.
+    """
+    import shutil
+
+    settings = get_settings()
+    if not settings.db_path.exists():
+        return None
+    tmp = settings.serve_db_path.with_suffix(".tmp")
+    try:
+        shutil.copy2(settings.db_path, tmp)
+        os.replace(tmp, settings.serve_db_path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        log.exception("could not publish the read-only snapshot")
+        return None
+    log.info("published read-only snapshot to %s", settings.serve_db_path.name)
+    return settings.serve_db_path
+
+
+def set_read_only(value: bool = True) -> None:
+    """Open the singleton read-only from here on.
+
+    DuckDB allows a single writer per file, so an API process holding a read/write handle blocks
+    ``make refresh`` entirely. The API only ever reads, so it declares that and the two can run
+    side by side -- which is exactly what ``make dev`` does.
+    """
+    global _read_only
+    close_connection()
+    _read_only = value
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
@@ -48,9 +111,8 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     global _singleton
     with _lock:
         if _singleton is None:
-            settings = get_settings()
-            settings.ensure_dirs()
-            _singleton = duckdb.connect(str(settings.db_path))
+            get_settings().ensure_dirs()
+            _singleton = duckdb.connect(str(active_db_path()), read_only=_read_only)
         return _singleton
 
 

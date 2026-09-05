@@ -273,6 +273,136 @@ def _resolve_week(season: int, week: int) -> tuple[int, int]:
 
 
 @app.command()
+def simulate(
+    season: Annotated[int, typer.Option()] = 0,
+    week: Annotated[int, typer.Option()] = 0,
+    sims: Annotated[int, typer.Option(help="Simulations per game")] = 5000,
+    top: Annotated[int, typer.Option(help="How many correlations to print")] = 20,
+) -> None:
+    """Drive-level joint simulation, for correlation between players in the same game (§5.8)."""
+    from backend.models.simulate import run_simulation, top_correlations
+
+    season, week = _resolve_week(season, week)
+    summary = run_simulation(season, week, n_sims=sims)
+    if not summary.get("run_id"):
+        console.print("[yellow]nothing to simulate — run `make refresh` first[/yellow]")
+        return
+    console.print_json(json.dumps(summary, default=str))
+
+    df = top_correlations(season, week, top)
+    table = Table("game", "player A", "stat", "player B", "stat", "r", "same team",
+                  title="Strongest simulated relationships")
+    for r in df.to_dicts():
+        table.add_row(
+            r["game_id"], r["player_a"] or "?", r["stat_a"], r["player_b"] or "?", r["stat_b"],
+            f"{r['correlation']:+.3f}", "yes" if r["same_team"] else "no",
+        )
+    console.print(table)
+    console.print(
+        "\n[dim]The marginals come from the analytic model; the simulation supplies only the "
+        "dependence between them.[/dim]"
+    )
+
+
+@app.command()
+def parlay(
+    legs: Annotated[
+        str,
+        typer.Argument(
+            help='Semicolon-separated "Player Name:stat:line:over|under", e.g. '
+            '"Joe Burrow:passing_yards:265.5:over;Ja\'Marr Chase:receiving_yards:88.5:over"'
+        ),
+    ],
+    season: Annotated[int, typer.Option()] = 0,
+    week: Annotated[int, typer.Option()] = 0,
+) -> None:
+    """Price a multi-leg ticket off the simulation, against the naive independent product."""
+    from backend.models.project import resolve_player
+    from backend.models.simulate import joint_probability
+
+    season, week = _resolve_week(season, week)
+    parsed: list[tuple[str, str, float, str]] = []
+    for raw in legs.split(";"):
+        parts = [x.strip() for x in raw.split(":")]
+        if len(parts) != 4:
+            raise typer.BadParameter(f"could not parse leg {raw!r}")
+        gsis = resolve_player(parts[0])
+        if not gsis:
+            raise typer.BadParameter(f"no player matching {parts[0]!r}")
+        parsed.append((gsis, parts[1], float(parts[2]), parts[3].lower()))
+
+    result = joint_probability(season, week, parsed)
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/red]")
+        return
+
+    table = Table("leg", "line", "side", "P(leg)")
+    for leg in result["legs"]:
+        table.add_row(leg["stat"], str(leg["line"]), leg["side"], f"{leg['leg_probability']:.1%}")
+    console.print(table)
+    console.print(
+        f"\njoint (correlated): [bold]{result['joint']:.2%}[/bold]\n"
+        f"naive independent:  {result['independent']:.2%}\n"
+        f"correlation multiple: [bold]{result['correlation_multiple']:.2f}x[/bold]"
+    )
+    console.print(
+        "[dim]A multiple above 1 means the legs move together, so a fairly priced parlay pays "
+        "LESS than multiplying the individual prices. Books charge 20-35% hold on same-game "
+        "parlays for exactly this.[/dim]"
+    )
+
+
+@app.command()
+def notes(
+    season: Annotated[int, typer.Option()] = 0,
+    week: Annotated[int, typer.Option()] = 0,
+    player: Annotated[str, typer.Option(help="Just this player; empty = the whole board")] = "",
+    deep_dives: Annotated[bool, typer.Option(help="Include the per-player narratives")] = True,
+) -> None:
+    """Generate the week's LLM notes (§7). Does nothing useful without ANTHROPIC_API_KEY."""
+    from backend.llm.tasks import deep_dive_note, generate_week_notes, injury_note
+
+    season, week = _resolve_week(season, week)
+    if not get_settings().has_anthropic:
+        console.print("[yellow]ANTHROPIC_API_KEY not set — narratives are skipped and the UI "
+                      "omits them. Everything else works.[/yellow]")
+
+    if player:
+        from backend.models.project import resolve_player
+
+        gsis = resolve_player(player)
+        if not gsis:
+            raise typer.BadParameter(f"no player matching {player!r}")
+        console.print_json(json.dumps({"injury": injury_note(gsis, season, week),
+                                       "deep_dive": deep_dive_note(gsis, season, week)}, default=str))
+        return
+
+    console.print_json(json.dumps(generate_week_notes(season, week, deep_dives), default=str))
+
+
+@app.command()
+def llm() -> None:
+    """LLM token usage and the per-refresh cap (§7)."""
+    from backend.llm.client import token_usage
+
+    usage = token_usage()
+    table = Table("task", "cached calls", "input tokens", "output tokens")
+    for r in usage["by_task"]:
+        table.add_row(r["task"], str(r["calls"]), f"{r['input_tokens']:,}", f"{r['output_tokens']:,}")
+    console.print(table)
+    console.print(f"this refresh: {usage['calls_this_refresh']}/{usage['cap']} calls")
+
+
+@app.command()
+def publish() -> None:
+    """Publish the read-only snapshot the API serves from."""
+    from backend.db.connection import publish_snapshot
+
+    path = publish_snapshot()
+    console.print(f"published {path}" if path else "[red]nothing to publish[/red]")
+
+
+@app.command()
 def config() -> None:
     """Print the resolved configuration, with secrets masked."""
     s = get_settings()

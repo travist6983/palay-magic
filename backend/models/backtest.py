@@ -437,10 +437,31 @@ def run_backtest(
             ],
         )
 
+    _restore_live_week()
+
     table = calibration_table(run_id, positions)
     if not quiet:
         print_calibration(table, run_id, week_results)
     return table
+
+
+def _restore_live_week() -> None:
+    """Rebuild ``adjusted_game_log`` for the live week after a replay.
+
+    Most derived tables are keyed on (season, week), so replaying 2025 leaves the live 2026 rows
+    alone. ``adjusted_game_log`` is not: it holds one row per (player, game, stat) scored against
+    whatever cutoff last built it, so a backtest ending at 2025 week 18 leaves the app showing a
+    game log that stops at week 17. Rebuilding for the live week undoes that.
+    """
+    from backend.models.adjust import build_adjusted_game_logs
+    from backend.state import current_state
+
+    try:
+        state = current_state()
+        build_adjusted_game_logs(state.season, state.week)
+        log.info("restored adjusted_game_log for the live week %s/%s", state.season, state.week)
+    except Exception:  # noqa: BLE001 - a failed restore must not lose the backtest results
+        log.exception("could not restore the live adjusted game log; run `make refresh`")
 
 
 def calibration_table(run_id: str, positions: list[str] | None = None) -> pl.DataFrame:

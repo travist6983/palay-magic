@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+  body {
+    @apply bg-ink text-chalk antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+  /* Tabular figures everywhere numbers are compared down a column. */
+  table {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-lg border border-ink-line bg-ink-soft;
+  }
+  .th {
+    @apply px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider text-chalk-faint;
+  }
+  .td {
+    @apply whitespace-nowrap px-3 py-2 text-sm;
+  }
+  .chip {
+    @apply inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide;
+  }
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+}

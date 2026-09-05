@@ -85,9 +85,8 @@ def backfill(seasons: list[int] | None = None, force: bool = False) -> list[Stag
     # Calibration is expensive (it refits every ridge penalty at every week of history) and the
     # penalties it produces are stable, so it belongs on backfill rather than the weekly refresh.
     from backend.models.adjust import calibrate_metrics, compute_unit_facts
-    from backend.models.gamelog import build_all as build_gamelogs
-
     from backend.models.environment import fit_environment_models
+    from backend.models.gamelog import build_all as build_gamelogs
     from backend.models.injury import compute_play_rates
 
     stages += [
@@ -121,8 +120,21 @@ def refresh(force: bool = False) -> list[StageResult]:
     ]
 
     stages += _model_stages(state.season, state.week)
+    stages.append(_run("llm.notes", _llm_stage, state.season, state.week))
     _record_refresh(state, stages)
+
+    # Publish the snapshot the API serves from, so a running `make dev` picks up this refresh.
+    from backend.db.connection import publish_snapshot
+
+    stages.append(_run("publish", publish_snapshot))
     return stages
+
+
+def _llm_stage(season: int, week: int):
+    """Generate the week's narratives, inside the per-refresh cap (§7). No key means no notes."""
+    from backend.llm.tasks import generate_week_notes
+
+    return generate_week_notes(season, week)
 
 
 def _model_stages(season: int, week: int) -> list[StageResult]:
