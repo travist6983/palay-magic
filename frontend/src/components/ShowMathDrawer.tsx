@@ -32,6 +32,11 @@ export function formatMathValue(value: number | null): string {
   return value.toPrecision(3)
 }
 
+/** Quantiles of an integer-valued stat are counts, not measurements. */
+function formatQuantile(dist: DistributionParams, value: number): string {
+  return dist.integer_valued ? String(Math.round(value)) : formatMathValue(value)
+}
+
 interface Section {
   name: string
   steps: { step: MathStep; index: number }[]
@@ -134,10 +139,10 @@ export function ShowMathDrawer({ stat, label, steps, open, onToggle, result }: S
                   mean {formatMathValue(result.mean)}
                 </span>
                 <span className="num text-chalk-dim">
-                  median {formatMathValue(result.median)}
+                  median {formatQuantile(result, result.median)}
                 </span>
                 <span className="num text-chalk-dim">
-                  p25–p75 {formatMathValue(result.p25)}–{formatMathValue(result.p75)}
+                  p25–p75 {formatQuantile(result, result.p25)}–{formatQuantile(result, result.p75)}
                 </span>
               </div>
             ) : null}

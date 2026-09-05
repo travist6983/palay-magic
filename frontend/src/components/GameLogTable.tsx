@@ -20,6 +20,11 @@ export interface GameLogTableProps {
 
 const RANKS = 32
 
+/** Gamebook counts are whole numbers; only the opponent-adjusted value needs decimals. */
+function formatRaw(value: number): string {
+  return Number.isInteger(value) ? String(value) : fmtStat(value)
+}
+
 export function GameLogTable({
   rows,
   statOrder,
@@ -143,12 +148,12 @@ function LogCell({ cell, opponent, label, highlighted }: LogCellProps) {
       className={`td text-right ${highlighted ? 'bg-accent/10' : tint}`}
       title={`${label} vs ${opponent ?? 'unknown'} — defence ranked ${
         rank === null ? 'n/a' : `${rank}/${RANKS}`
-      } (1 = softest), ${multiplierLabel(cell.opponent_multiplier)} vs league average. Raw ${fmtStat(
+      } (1 = softest), ${multiplierLabel(cell.opponent_multiplier)} vs league average. Raw ${formatRaw(
         cell.raw_value,
       )} adjusts to ${fmtStat(cell.adjusted_value)}.`}
     >
       <div className="num whitespace-nowrap">
-        <span className="text-chalk">{fmtStat(cell.raw_value)}</span>{' '}
+        <span className="text-chalk">{formatRaw(cell.raw_value)}</span>{' '}
         <span className={multiplierColour(cell.opponent_multiplier)}>
           ({fmtStat(cell.adjusted_value)})
         </span>

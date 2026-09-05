@@ -195,7 +195,7 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
     { id: 'multiplier', desc: metric.higherIsSofter },
   ])
 
-  const { data, error, isPending, isFetching, refetch } = useQuery({
+  const { data, error, isPending, isPaused, isFetching, refetch } = useQuery({
     queryKey: ['defense', position, metric.key],
     queryFn: () => api.defense(position, metric.key),
     placeholderData: keepPreviousData,
@@ -235,7 +235,11 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
           </h2>
           <div className="num text-xs text-chalk-faint">
             {data ? `${data.season} · week ${data.week}` : 'loading…'}
-            {isFetching ? <span className="ml-2">refreshing…</span> : null}
+            {isPaused ? (
+              <span className="ml-2 text-warn">paused</span>
+            ) : isFetching ? (
+              <span className="ml-2">refreshing…</span>
+            ) : null}
           </div>
         </div>
 
@@ -310,6 +314,22 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
             Retry
           </button>
         </div>
+      ) : isPaused && !data ? (
+        <div className="px-4 py-6">
+          <div className="text-sm font-medium text-chalk">Paused — the table has not loaded</div>
+          <p className="mt-2 text-xs text-chalk-dim">
+            The request is paused rather than retried, which happens while the browser reports no
+            connection or the tab sits in the background. It resumes on its own when the tab is
+            focused again.
+          </p>
+          <button
+            type="button"
+            onClick={() => void refetch()}
+            className="mt-3 rounded border border-ink-line px-2 py-1 text-xs text-chalk hover:border-accent hover:text-accent"
+          >
+            Try now
+          </button>
+        </div>
       ) : isPending ? (
         <SkeletonRows rows={10} />
       ) : rows.length === 0 ? (
@@ -319,10 +339,13 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
         </p>
       ) : (
         <>
-          {error ? (
+          {error || isPaused ? (
             <p className="border-b border-ink-line bg-warn/10 px-4 py-2 text-xs text-warn">
-              Showing the last loaded table — the refresh failed
-              {error instanceof ApiError ? ` (${error.status})` : ''}.
+              Showing the last loaded table — the refresh{' '}
+              {isPaused
+                ? 'is paused until the tab is focused or the connection returns'
+                : `failed${error instanceof ApiError ? ` (${error.status})` : ''}`}
+              .
             </p>
           ) : null}
           <div className="overflow-x-auto">

@@ -51,14 +51,23 @@ def _run(name: str, fn, *args, **kwargs) -> StageResult:
 
 
 def _summarise(out: Any) -> str:
-    """Render a stage's return value as one short line."""
+    """Render a stage's return value as ONE short line.
+
+    Stages return whatever is natural for them, including polars frames, and a frame printed into
+    a progress summary swamps the terminal. Anything with a row count is reported as a count.
+    """
     if out is None:
         return ""
+    if hasattr(out, "height") and hasattr(out, "columns"):
+        return f"{out.height:,} rows"
+    if isinstance(out, dict):
+        return ", ".join(f"{k}={v}" for k, v in out.items())
     if isinstance(out, list):
         parts = [str(x) for x in out]
         shown = ", ".join(parts[:4])
         return shown + (f", +{len(parts) - 4} more" if len(parts) > 4 else "")
-    return str(out)
+    text = str(out)
+    return text if len(text) <= 120 else text[:117] + "..."
 
 
 def ensure_schema() -> list[str]:
@@ -188,7 +197,7 @@ def _environment_stage():
 def _injury_stage():
     from backend.models.injury import compute_play_rates
 
-    return lambda season, week: compute_play_rates()
+    return lambda season, week: compute_play_rates().height
 
 
 def _adjust_stage():

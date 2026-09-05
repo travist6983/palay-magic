@@ -23,8 +23,10 @@ Endpoints used
 
 Rate limiting
 -------------
-Undocumented, so we self-limit: at most ``_MAX_IN_FLIGHT`` (6) concurrent requests and a
-``_REQUEST_DELAY_S`` pause inside each worker before it fires, which caps us near 40 req/s.
+Undocumented, so we self-limit: at most ``_MAX_IN_FLIGHT`` (16) concurrent requests and a
+``_REQUEST_DELAY_S`` pause inside each worker before it fires. Hydrating all 32 teams means
+roughly 1,900 requests; at these settings that is about 22 seconds, which is the largest single
+line item in a 39-second refresh and the reason the limits are not lower.
 Transport errors, 429 and 5xx are retried by :data:`network_retry`; 4xx are not.
 
 TODO(owner of backend/db/views.py): ``ingest_weather()`` writes ``data/raw/espn_weather.parquet``
@@ -90,10 +92,10 @@ TEAMS_CACHE_TTL_HOURS = 24.0 * 7.0
 INJURIES_FILE = "espn_injuries.parquet"
 WEATHER_FILE = "espn_weather.parquet"
 
-_MAX_IN_FLIGHT = 6
+_MAX_IN_FLIGHT = 16
 """Concurrent requests to ESPN. Politeness ceiling, not a throughput target."""
 
-_REQUEST_DELAY_S = 0.15
+_REQUEST_DELAY_S = 0.03
 """Pause each worker takes before firing. With 6 workers this caps us near 40 req/s."""
 
 _TIMEOUT_S = 25.0

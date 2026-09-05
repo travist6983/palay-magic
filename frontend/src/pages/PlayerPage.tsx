@@ -9,6 +9,7 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { useCallback, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
 import { useParams } from 'react-router-dom'
 import { DistributionChart } from '../components/DistributionChart'
 import { EnvironmentCard } from '../components/EnvironmentCard'
@@ -129,7 +130,7 @@ export function PlayerPage({ gsisId }: PlayerPageProps = {}) {
     selectedLineText.trim() !== '' && Number.isFinite(parsedLine) ? parsedLine : null
 
   return (
-    <div className="mx-auto flex max-w-[1500px] flex-col gap-3 p-3">
+    <div className="flex flex-col gap-3">
       {query.isError ? (
         <div className="rounded border border-bad/40 bg-bad/10 px-3 py-2 text-[11px] text-bad">
           Refresh failed ({describeError(query.error)}). Showing the last data this tab loaded.
@@ -161,7 +162,7 @@ export function PlayerPage({ gsisId }: PlayerPageProps = {}) {
             onShowMath={handleShowMath}
           />
         </div>
-        <div className="xl:sticky xl:top-3 xl:self-start">
+        <div className="xl:sticky xl:top-[76px] xl:self-start">
           {selectedProjection && selectedDist ? (
             <DistributionChart
               label={selectedProjection.label}
@@ -414,10 +415,10 @@ function Notice({
   tone: 'bad' | 'warn'
   title: string
   body: string
-  action?: React.ReactNode
+  action?: ReactNode
 }) {
   return (
-    <div className="mx-auto max-w-[1500px] p-3">
+    <div>
       <div
         className={`card flex items-center gap-3 p-3 ${
           tone === 'bad' ? 'border-bad/40' : 'border-warn/40'
@@ -437,7 +438,7 @@ function Notice({
 
 function PlayerSkeleton() {
   return (
-    <div className="mx-auto flex max-w-[1500px] animate-pulse flex-col gap-3 p-3">
+    <div className="flex animate-pulse flex-col gap-3">
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
         <div className="card h-32 xl:col-span-2" />
         <div className="card h-32" />

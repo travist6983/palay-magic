@@ -199,7 +199,7 @@ function SkeletonRows({ rows }: { rows: number }) {
 /** The calibration section of the model-health page: headline numbers, caveats, and the table. */
 export function CalibrationTable({ className = '' }: CalibrationTableProps) {
   const [sorting, setSorting] = useState<SortingState>([{ id: 'position', desc: false }])
-  const { data, error, isPending, isFetching, refetch } = useQuery({
+  const { data, error, isPending, isPaused, isFetching, refetch } = useQuery({
     queryKey: ['calibration'],
     queryFn: () => api.calibration(),
   })
@@ -234,7 +234,11 @@ export function CalibrationTable({ className = '' }: CalibrationTableProps) {
             ) : (
               'no run loaded'
             )}
-            {isFetching ? <span className="ml-2 text-chalk-faint">refreshing…</span> : null}
+            {isPaused ? (
+              <span className="ml-2 text-warn">paused</span>
+            ) : isFetching ? (
+              <span className="ml-2 text-chalk-faint">refreshing…</span>
+            ) : null}
           </div>
         </div>
         {data ? (
@@ -272,6 +276,21 @@ export function CalibrationTable({ className = '' }: CalibrationTableProps) {
             Retry
           </button>
         </Notice>
+      ) : isPaused && !data ? (
+        <Notice title="Paused — the calibration run has not loaded">
+          <p>
+            The request is paused rather than retried, which happens while the browser reports no
+            connection or the tab sits in the background. It resumes on its own when the tab is
+            focused again.
+          </p>
+          <button
+            type="button"
+            onClick={() => void refetch()}
+            className="mt-3 rounded border border-ink-line px-2 py-1 text-xs text-chalk hover:border-accent hover:text-accent"
+          >
+            Try now
+          </button>
+        </Notice>
       ) : isPending ? (
         <SkeletonRows rows={8} />
       ) : !data ? (
@@ -288,10 +307,13 @@ export function CalibrationTable({ className = '' }: CalibrationTableProps) {
         </Notice>
       ) : (
         <>
-          {error ? (
+          {error || isPaused ? (
             <p className="border-b border-ink-line bg-warn/10 px-4 py-2 text-xs text-warn">
-              Showing the last loaded run — the refresh failed
-              {error instanceof ApiError ? ` (${error.status})` : ''}.
+              Showing the last loaded run — the refresh{' '}
+              {isPaused
+                ? 'is paused until the tab is focused or the connection returns'
+                : `failed${error instanceof ApiError ? ` (${error.status})` : ''}`}
+              .
             </p>
           ) : null}
 

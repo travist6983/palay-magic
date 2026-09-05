@@ -62,7 +62,13 @@ export function PriorSeasonBanner({ meta }: PriorSeasonBannerProps) {
 }
 
 export function Header({ className = '' }: HeaderProps) {
-  const { data: meta, isError, fetchStatus } = useQuery({ queryKey: ['meta'], queryFn: api.meta })
+  // networkMode 'always': the API is on 127.0.0.1, so the browser's public-internet online
+  // heuristic must not pause the fetch (it would leave the whole shell without a week or status).
+  const { data: meta, isError, fetchStatus } = useQuery({
+    queryKey: ['meta'],
+    queryFn: api.meta,
+    networkMode: 'always',
+  })
 
   const positions = meta && meta.positions.length > 0 ? meta.positions : POSITIONS
 
@@ -80,7 +86,12 @@ export function Header({ className = '' }: HeaderProps) {
                 status unavailable
               </span>
             ) : fetchStatus === 'paused' ? (
-              <span className="text-warn">offline — status will load when the connection returns</span>
+              <span
+                className="text-warn"
+                title="React Query paused the request (browser offline or tab unfocused); it retries on its own."
+              >
+                status paused — will retry
+              </span>
             ) : (
               <span className="text-chalk-faint">loading status…</span>
             ))}

@@ -206,6 +206,9 @@ function ProjectionRow({
   onShowMath,
 }: ProjectionRowProps) {
   const dist = activeDistribution(projection, mode)
+  const blended =
+    projection.unconditional !== null &&
+    distributionsDiffer(projection.distribution, projection.unconditional)
   const fallback = String(defaultLine(projection.distribution))
   const text = lineText ?? fallback
   const line = Number.parseFloat(text)
@@ -247,12 +250,21 @@ function ProjectionRow({
             </span>
           ) : null}
           {mode === 'unconditional' && projection.play_probability < 0.999 ? (
-            <span
-              className="chip bg-ink-line text-chalk-faint"
-              title={`Blended with P(plays) = ${pct(projection.play_probability, 1)}.`}
-            >
-              ×{projection.play_probability.toFixed(2)}
-            </span>
+            blended ? (
+              <span
+                className="chip bg-accent/15 text-accent"
+                title={`Blended with P(plays) = ${pct(projection.play_probability, 1)}. At a book an inactive player voids the bet instead, so this basis answers "what does he do this week", not "what does this ticket pay".`}
+              >
+                ×{projection.play_probability.toFixed(2)}
+              </span>
+            ) : (
+              <span
+                className="chip bg-ink-line text-chalk-faint"
+                title="The API returned an identical unconditional distribution for this stat, so the toggle does not move this row."
+              >
+                unblended
+              </span>
+            )
           ) : null}
         </div>
       </td>

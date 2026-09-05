@@ -45,6 +45,8 @@ export function PlayerSearch({
     queryFn: () => api.search(query),
     enabled: query.length >= MIN_QUERY,
     staleTime: 60_000,
+    // The backend is local; do not let the browser's online heuristic pause the lookup.
+    networkMode: 'always',
   })
 
   const hits = useMemo(() => (data ?? []).slice(0, limit), [data, limit])
@@ -156,7 +158,7 @@ export function PlayerSearch({
           {isError ? (
             <div className="px-3 py-2 text-xs text-bad">Search unavailable.</div>
           ) : fetchStatus === 'paused' ? (
-            <div className="px-3 py-2 text-xs text-warn">Offline — search is unavailable.</div>
+            <div className="px-3 py-2 text-xs text-warn">Search paused — the browser is offline.</div>
           ) : data === undefined ? (
             <div className="px-3 py-2 text-xs text-chalk-faint">Searching…</div>
           ) : hits.length === 0 ? (
