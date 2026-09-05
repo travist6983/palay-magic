@@ -121,3 +121,59 @@ Settlement rules baked into the projection (from `sharp_bettor_prop_reference.md
 the browser recomputes `P(over line)` locally on every keystroke — no API call per keystroke (§8).
 The same parameters drive the "Show math" drawer, so what you see is literally what produced the
 number.
+
+## D11. Injury play rates are conditioned on role, not just designation
+
+Computed the obvious way — `P(played)` per (designation, practice status) — the 2023–2025 data
+says a **Questionable + Full** player plays only **70.6%** of the time. That contradicts
+`free_nfl_data_sources.md`, which calls that cell "very high" (~95%).
+
+It is not a join bug. It is population: the weekly injury report is dominated by fringe players
+who often do not dress at all, and pooling them with starters drags every cell down. Splitting by
+the player's mean snap share over the **previous four weeks**:
+
+| Designation | Final practice | Starter (≥55% snaps) | n |
+|---|---|---|---|
+| Questionable | Full | **84.8%** | 302 |
+| Questionable | Limited | **73.7%** | 1,299 |
+| Questionable | DNP | **53.9%** | 401 |
+| Doubtful | DNP | 1.4% | 146 |
+| Out | any | 0.0% | 1,400 |
+
+Which reproduces the doc's qualitative table ("very high / moderate / roughly coin flip / low /
+zero") — the DNP cell in particular lands within a point of "coin flip".
+
+Applying the pooled 70.6% to a Questionable starting WR would have under-projected him by ~15
+points of play probability, so this dimension is load-bearing. `role_bucket` is part of the
+`injury_play_rates` primary key (migration 002).
+
+**The trap that produced a wrong answer first:** deriving the role window from the same
+snap-counts join that decides `played` makes every player *with* a role bucket one who played by
+construction — every cell reads exactly 1.000. The role window must be computed off the
+injury-report spine with a left join to prior weeks, never off the current week's snap row.
+
+Second output of the same table: **E[snap share | played] ≈ 0.76 for a Questionable starter.** A
+banged-up starter who suits up is not a full-snap player, and usage must be scaled accordingly
+(§5.4).
+
+## D12. Sleeper's `gsis_id` covers only a third of its dump — recover the rest by name
+
+Sleeper supplies `gsis_id` for 3,893 of 12,226 players. CeeDee Lamb, Bucky Irving and Brandon
+Aubrey all lack one. Taken at face value, ~20% of 2026-rostered players at prop positions get no
+injury designation or practice status at all, which guts §5.7.
+
+`backend/ingest/crosswalk.py::_resolve_sleeper_by_name` recovers them with two fallback keys,
+applied only when the match is **unique on both sides**: `espn_id`, then
+`normalised name | team | position` against the current roster. Ambiguous keys are dropped rather
+than guessed — a wrong crosswalk row silently attaches one player's injury to another.
+
+Coverage among 2026-rostered players at the six prop positions, before → after:
+
+| Pos | Before | After |
+|---|---|---|
+| QB | 95.0% | 96.6% |
+| RB | 89.3% | 92.2% |
+| WR | 82.8% | 89.4% |
+| TE | 78.0% | 88.3% |
+| K | 82.5% | 95.0% |
+| LB | 78.8% | 86.0% |
