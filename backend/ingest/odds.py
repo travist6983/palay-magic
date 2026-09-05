@@ -21,7 +21,8 @@ to schedules and mark the ``the-odds-api`` freshness badge yellow. Nothing here 
 from __future__ import annotations
 
 import statistics
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,25 @@ def _download_teams() -> pl.DataFrame:
     return nfl.load_teams()
 
 
+@contextmanager
+def _read_connection() -> Iterator[duckdb.DuckDBPyConnection]:
+    """Open a connection for reading, tolerating a read-write connection already open.
+
+    DuckDB refuses a read-only connection when the same process already holds a read-write one
+    ("Can't open a connection to same database file with a different configuration"), which is
+    exactly the situation inside the FastAPI app, whose ``get_connection()`` singleton is
+    read-write. Falling back to the default configuration reads the same data instead of
+    reporting the database as unreadable and silently returning nothing.
+    """
+    with ExitStack() as stack:
+        try:
+            con = stack.enter_context(connect(read_only=True))
+        except duckdb.Error as exc:
+            log.debug("read-only connection refused (%s); reading with a read-write one", exc)
+            con = stack.enter_context(connect())
+        yield con
+
+
 def _load_raw(view: str, filename: str, loader: Callable[[], pl.DataFrame]) -> pl.DataFrame:
     """Read a raw nflverse dataset, preferring local data over the network.
 
@@ -142,7 +162,7 @@ def _load_raw(view: str, filename: str, loader: Callable[[], pl.DataFrame]) -> p
     refresh uses; the download keeps this module usable before the nflverse ingest has run.
     """
     try:
-        with connect(read_only=True) as con:
+        with _read_connection() as con:
             if view_exists(con, view):
                 return con.execute(f"SELECT * FROM {view}").pl()  # noqa: S608 - fixed view names
     except duckdb.Error as exc:
@@ -253,14 +273,26 @@ def team_abbreviation_map(valid_abbrs: Collection[str] | None = None) -> dict[st
 # ---------------------------------------------------------------------------
 
 
+class OddsRequestError(RuntimeError):
+    """The server answered and the answer is unusable. Deliberately **not** retried.
+
+    Not an ``OSError``/``TimeoutError``, so :data:`~backend.ingest.base.network_retry` leaves it
+    alone — which is the point: the request was already served and counted by the API.
+    """
+
+
 @network_retry
 def _fetch_odds(api_key: str) -> tuple[list[dict[str, Any]], str | None]:
     """Make the single Odds API request and return ``(events, x-requests-remaining)``.
 
-    httpx transport errors are re-raised as ``ConnectionError``/``TimeoutError`` so that
-    ``network_retry`` (which retries ``OSError``/``TimeoutError``) actually sees them. 5xx is
-    retried the same way; a 4xx (bad key, quota refused) is raised immediately because retrying
-    it would only waste time and possibly quota.
+    **At most one request reaches the server per call**, which is what D4 promises and what the
+    ``api_budget`` counter assumes. Only a failure to *establish* the connection is retried
+    (``httpx.ConnectError``/``ConnectTimeout``, re-raised as ``ConnectionError`` because
+    ``network_retry`` retries ``OSError``/``TimeoutError``): nothing was served, so those retries
+    cost no quota. Anything the server did answer — 4xx, 5xx, a read timeout, a body that is not
+    a JSON list — raises :class:`OddsRequestError` and is *not* retried, because ``network_retry``
+    would otherwise issue up to four metered requests while ``consume()`` recorded one.
+    The caller falls back to nflverse schedules for this refresh and tries again on the next.
     """
     params = {
         "apiKey": api_key,
@@ -270,22 +302,29 @@ def _fetch_odds(api_key: str) -> tuple[list[dict[str, Any]], str | None]:
     }
     try:
         response = httpx.get(ODDS_URL, params=params, timeout=REQUEST_TIMEOUT)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        raise ConnectionError(f"the-odds-api unreachable: {exc}") from exc
     except httpx.TimeoutException as exc:
-        raise TimeoutError(f"the-odds-api timed out: {exc}") from exc
+        raise OddsRequestError(f"the-odds-api timed out mid-request: {exc}") from exc
     except httpx.TransportError as exc:
-        raise ConnectionError(f"the-odds-api transport error: {exc}") from exc
-
-    if response.status_code >= 500:
-        raise ConnectionError(f"the-odds-api returned HTTP {response.status_code}")
-    response.raise_for_status()
+        raise OddsRequestError(f"the-odds-api transport error: {exc}") from exc
 
     remaining = response.headers.get("x-requests-remaining")
     used = response.headers.get("x-requests-used")
-    log.info("the-odds-api: x-requests-remaining=%s x-requests-used=%s", remaining, used)
+    log.info(
+        "the-odds-api: HTTP %s x-requests-remaining=%s x-requests-used=%s",
+        response.status_code,
+        remaining,
+        used,
+    )
+
+    if response.status_code >= 400:
+        body = response.text[:200].replace("\n", " ")
+        raise OddsRequestError(f"the-odds-api returned HTTP {response.status_code}: {body}")
 
     payload = response.json()
     if not isinstance(payload, list):
-        raise ValueError(f"unexpected the-odds-api payload of type {type(payload).__name__}")
+        raise OddsRequestError(f"unexpected the-odds-api payload of type {type(payload).__name__}")
     return payload, remaining
 
 
@@ -400,24 +439,62 @@ def _consensus_from_bookmakers(
     }
 
 
+def _flip_orientation(consensus: dict[str, Any]) -> dict[str, Any]:
+    """Restate a consensus quoted from the other team's point of view.
+
+    Used when the book calls the nflverse away team the home team (neutral-site games). The
+    spread negates and the two spread prices swap; the total is orientation-free.
+    """
+    flipped = dict(consensus)
+    if flipped.get("spread_line") is not None:
+        flipped["spread_line"] = -float(flipped["spread_line"])
+    flipped["home_spread_price"] = consensus.get("away_spread_price")
+    flipped["away_spread_price"] = consensus.get("home_spread_price")
+    return flipped
+
+
+def _kickoff_gap(commence: datetime | None, kickoff: datetime | None) -> float:
+    """Seconds between an event's ``commence_time`` and the scheduled kickoff.
+
+    ``commence_time`` is UTC and ``kickoff`` is the naive US-Eastern wall clock nflverse
+    publishes, so the two are offset by a constant 4-5 hours. That is irrelevant here: this only
+    ever ranks candidate events for the *same* matchup, where the right one is hours away and a
+    wrong one (a preseason meeting, a later-season rematch) is weeks away. ``inf`` when either
+    timestamp is missing, so a dated candidate always beats an undated one.
+    """
+    if commence is None or kickoff is None:
+        return float("inf")
+    return abs((commence.replace(tzinfo=None) - kickoff).total_seconds())
+
+
 def _parse_odds_payload(
     payload: list[dict[str, Any]], schedule: pl.DataFrame, season: int, week: int
 ) -> pl.DataFrame:
-    """Turn the Odds API payload into one consensus row per scheduled game.
+    """Turn the Odds API payload into **exactly one** consensus row per scheduled game.
 
     Team labels are mapped to nflverse abbreviations via :func:`team_abbreviation_map`, built
     from ``raw_teams`` and narrowed to the teams playing this week. A game whose team we cannot
     map, or that has no schedule row for this week (a different week's event, or a preseason
     fixture), is **logged** and dropped — never dropped silently.
+
+    Two things the endpoint does that a naive parse gets wrong:
+
+    * It returns *every* upcoming NFL event, so the same matchup can appear twice (a preseason
+      meeting, or an event relisted under a new id). One row per ``game_id`` is a hard
+      requirement — ``game_environment.game_id`` is a primary key and the join in
+      :func:`build_game_environment` would otherwise fan out — so duplicates are resolved to the
+      candidate whose ``commence_time`` is closest to the scheduled kickoff, and the loser is
+      logged.
+    * For a neutral-site game (the international series, the Super Bowl) the book may designate
+      the other side as home. Rather than dropping the game, the schedule's orientation wins and
+      the consensus is flipped through :func:`_flip_orientation`.
     """
     abbrs = set(schedule["home_team"].to_list()) | set(schedule["away_team"].to_list())
     name_map = team_abbreviation_map(abbrs)
-    game_ids = {
-        (row["home_team"], row["away_team"]): row["game_id"]
-        for row in schedule.iter_rows(named=True)
-    }
+    by_pair = {(row["home_team"], row["away_team"]): row for row in schedule.iter_rows(named=True)}
     fetched_at = utcnow()
-    rows: list[dict[str, Any]] = []
+    #: game_id -> (rank key, row). Lower rank key wins.
+    best: dict[str, tuple[tuple[float, int], dict[str, Any]]] = {}
 
     for event in payload:
         home_name = event.get("home_team")
@@ -435,8 +512,25 @@ def _parse_odds_payload(
             )
             continue
 
-        game_id = game_ids.get((home, away))
-        if game_id is None:
+        game = by_pair.get((home, away))
+        consensus = _consensus_from_bookmakers(event, str(home_name), str(away_name))
+        if game is None:
+            game = by_pair.get((away, home))
+            if game is not None:
+                log.warning(
+                    "the-odds-api: event %s lists %s at %s but nflverse has %s at %s "
+                    "(neutral site?); keeping the schedule orientation and flipping the spread",
+                    event.get("id"),
+                    away,
+                    home,
+                    away,
+                    home,
+                )
+                home, away = away, home
+                home_name, away_name = away_name, home_name
+                consensus = _flip_orientation(consensus)
+
+        if game is None:
             log.warning(
                 "the-odds-api: %s @ %s has no %s week %s schedule row; dropping event %s",
                 away,
@@ -447,23 +541,38 @@ def _parse_odds_payload(
             )
             continue
 
-        rows.append(
-            {
-                "season": season,
-                "week": week,
-                "game_id": game_id,
-                "event_id": event.get("id"),
-                "commence_time": _parse_commence_time(event.get("commence_time")),
-                "home_team": home,
-                "away_team": away,
-                "home_team_book": home_name,
-                "away_team_book": away_name,
-                "fetched_at": fetched_at,
-                **_consensus_from_bookmakers(event, str(home_name), str(away_name)),
-            }
-        )
+        game_id = game["game_id"]
+        commence = _parse_commence_time(event.get("commence_time"))
+        row = {
+            "season": season,
+            "week": week,
+            "game_id": game_id,
+            "event_id": event.get("id"),
+            "commence_time": commence,
+            "home_team": home,
+            "away_team": away,
+            "home_team_book": home_name,
+            "away_team_book": away_name,
+            "fetched_at": fetched_at,
+            **consensus,
+        }
+        rank = (_kickoff_gap(commence, game.get("kickoff")), -int(consensus["n_books"]))
 
-    return pl.DataFrame(rows, schema=ODDS_SCHEMA)
+        previous = best.get(game_id)
+        if previous is None:
+            best[game_id] = (rank, row)
+            continue
+        keep, drop = ((rank, row), previous) if rank < previous[0] else (previous, (rank, row))
+        log.warning(
+            "the-odds-api: %s is priced by two events; keeping %s (kicking off nearest the "
+            "scheduled time) and dropping %s",
+            game_id,
+            keep[1]["event_id"],
+            drop[1]["event_id"],
+        )
+        best[game_id] = keep
+
+    return pl.DataFrame([row for _, row in best.values()], schema=ODDS_SCHEMA)
 
 
 def odds_file(season: int, week: int) -> Path:
@@ -593,6 +702,39 @@ def ingest_odds(season: int, week: int, force: bool = False) -> IngestResult:
 # ---------------------------------------------------------------------------
 
 
+def _replace_week(out: pl.DataFrame, season: int, week: int) -> None:
+    """Swap one week's ``game_environment`` rows for ``out``, all or nothing.
+
+    The DELETE and the INSERT share one transaction. Without it a rejected INSERT (a duplicate
+    ``game_id``, a value the table will not take) leaves the week *deleted* and nothing written:
+    the app is then left with no game environment at all, which is worse than the stale rows it
+    was replacing and is precisely what D8 forbids.
+    """
+    with connect() as con:
+        con.register("ge_df", out)
+        try:
+            con.execute("BEGIN TRANSACTION")
+            try:
+                con.execute(
+                    "DELETE FROM game_environment WHERE season = ? AND week = ?", [season, week]
+                )
+                con.execute(
+                    "INSERT INTO game_environment "
+                    "(game_id, season, week, home_team, away_team, kickoff, spread_line, "
+                    " total_line, home_implied_total, away_implied_total, roof, surface, temp, "
+                    " wind, odds_source, observed_at) "
+                    "SELECT game_id, season, week, home_team, away_team, kickoff, spread_line, "
+                    "       total_line, home_implied_total, away_implied_total, roof, surface, "
+                    "       temp, wind, odds_source, observed_at FROM ge_df"
+                )
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+            con.execute("COMMIT")
+        finally:
+            con.unregister("ge_df")
+
+
 @resilient("nflverse", "game_environment")
 def build_game_environment(season: int, week: int, prefer_odds: bool = True) -> IngestResult:
     """Populate ``game_environment`` for one week: lines, implied totals, and weather.
@@ -628,15 +770,23 @@ def build_game_environment(season: int, week: int, prefer_odds: bool = True) -> 
 
     odds = _read_odds_file(season, week) if prefer_odds else None
     if odds is not None and not odds.is_empty():
-        schedule = schedule.join(
-            odds.select(
-                "game_id",
-                pl.col("spread_line").cast(pl.Float64).alias("odds_spread"),
-                pl.col("total_line").cast(pl.Float64).alias("odds_total"),
-            ),
-            on="game_id",
-            how="left",
+        priced = odds.select(
+            "game_id",
+            pl.col("spread_line").cast(pl.Float64).alias("odds_spread"),
+            pl.col("total_line").cast(pl.Float64).alias("odds_total"),
         )
+        # One row per game or the left join below fans out, duplicating schedule rows and
+        # tripping the game_id primary key. _parse_odds_payload guarantees it; a file written
+        # by an older build (or edited by hand) may not, and being sure costs one call.
+        deduped = priced.unique(subset="game_id", keep="first", maintain_order=True)
+        if deduped.height != priced.height:
+            log.warning(
+                "%s holds %d rows for %d games; keeping the first row per game",
+                odds_file(season, week).name,
+                priced.height,
+                deduped.height,
+            )
+        schedule = schedule.join(deduped, on="game_id", how="left")
     else:
         schedule = schedule.with_columns(
             pl.lit(None, dtype=pl.Float64).alias("odds_spread"),
@@ -703,30 +853,19 @@ def build_game_environment(season: int, week: int, prefer_odds: bool = True) -> 
             detail=f"no schedule rows for {season} week {week}; existing rows preserved",
         )
 
-    with connect() as con:
-        con.register("ge_df", out)
-        try:
-            # One transaction: a failed insert must not leave the week deleted.
-            con.execute("BEGIN TRANSACTION")
-            try:
-                con.execute(
-                    "DELETE FROM game_environment WHERE season = ? AND week = ?", [season, week]
-                )
-                con.execute(
-                    "INSERT INTO game_environment "
-                    "(game_id, season, week, home_team, away_team, kickoff, spread_line, "
-                    " total_line, home_implied_total, away_implied_total, roof, surface, temp, "
-                    " wind, odds_source, observed_at) "
-                    "SELECT game_id, season, week, home_team, away_team, kickoff, spread_line, "
-                    "       total_line, home_implied_total, away_implied_total, roof, surface, "
-                    "       temp, wind, odds_source, observed_at FROM ge_df"
-                )
-                con.execute("COMMIT")
-            except Exception:
-                con.execute("ROLLBACK")
-                raise
-        finally:
-            con.unregister("ge_df")
+    try:
+        _replace_week(out, season, week)
+    except duckdb.Error as exc:
+        # A rejected write is a database problem, not an nflverse outage. Handling it here
+        # instead of letting @resilient see it keeps the shared 'nflverse' freshness badge --
+        # which the nflverse ingest owns -- from being repainted with a DuckDB error string.
+        log.exception("game_environment: could not write %s week %s", season, week)
+        return IngestResult(
+            source="nflverse",
+            dataset="game_environment",
+            ok=False,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
 
     n_api = int(out.filter(pl.col("odds_source") == ODDS_API).height)
     n_lines = int(out.filter(pl.col("total_line").is_not_null()).height)
@@ -757,7 +896,7 @@ def implied_totals(season: int, week: int) -> pl.DataFrame:
     documented schema rather than raising, so the ranking and projection layers can degrade.
     """
     try:
-        with connect(read_only=True) as con:
+        with _read_connection() as con:
             games = con.execute(
                 "SELECT game_id, season, week, home_team, away_team, kickoff, spread_line, "
                 "       total_line, home_implied_total, away_implied_total, roof, surface, temp, "

@@ -251,11 +251,18 @@ def _prepare_players(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _prepare_rosters(df: pl.DataFrame) -> pl.DataFrame:
+def _prepare_rosters(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
     """Normalise one season of ``raw_rosters`` into one ``r_*`` row per player.
 
     A season's roster file has a row per player *per week* (2025 carries weeks 1-22), so the newest
-    week wins; a row that still knows the team is preferred over one that does not.
+    week wins; within one week a row that still knows the team is preferred over one that does not,
+    and the remaining ties break on the source row order so two runs agree.
+
+    Rows without a ``gsis_id`` are dropped here rather than collapsed by the de-duplication below,
+    which would otherwise fold *all* of them into a single row and under-report the loss.
+
+    Returns:
+        The prepared frame and the number of source rows dropped for a missing ``gsis_id``.
     """
     week = _integer(df, "week").fill_null(0).alias("_week")
     prepared = df.select(
@@ -277,11 +284,22 @@ def _prepare_rosters(df: pl.DataFrame) -> pl.DataFrame:
         _integer(df, "weight", min_valid=1).alias("r_weight"),
         _text(df, "headshot_url").alias("r_headshot_url"),
         _integer(df, "years_exp").alias("r_years_exp"),
+        # Marks a row as coming from the current roster. Survives the full join in _assemble, so
+        # _drop_ambiguous_ids can tell a current player from one who last played decades ago.
+        pl.lit(True).alias("_on_roster"),
     )
+    n_no_gsis = int(prepared.select(pl.col("gsis_id").is_null().sum()).item())
+    prepared = prepared.filter(pl.col("gsis_id").is_not_null())
     return (
-        prepared.sort(["_week", "r_team"], descending=[True, False], nulls_last=True)
+        prepared.sort(
+            ["_week", "r_team"],
+            descending=[True, False],
+            nulls_last=True,
+            maintain_order=True,
+        )
         .unique(subset=["gsis_id"], keep="first", maintain_order=True)
-        .drop("_week")
+        .drop("_week"),
+        n_no_gsis,
     )
 
 
@@ -292,8 +310,11 @@ def normalise_name(name: str | None) -> str | None:
     """Reduce a display name to a comparison key: lowercase, no punctuation, no generational suffix.
 
     ``D.J. Johnson``, ``DJ Johnson`` and ``D J Johnson`` all become ``dj johnson``;
-    ``Kenneth Murray, Jr.`` becomes ``kenneth murray``. Used only as a fallback key, and only when
-    the match is unique on both sides (see :func:`_resolve_sleeper_by_name`).
+    ``Kenneth Murray, Jr.`` becomes ``kenneth murray``.
+
+    This is the scalar spelling of the name component of :func:`_name_key_expr`, which is what
+    :func:`_resolve_sleeper_by_name` actually runs. Keep the two in step: they must agree for a
+    caller to reason about a match the fallback made.
     """
     if not name:
         return None
@@ -310,7 +331,11 @@ def _name_key_expr(name_col: str, team_col: str, position_col: str) -> pl.Expr:
             .str.to_lowercase()
             .str.replace_all(r"[^a-z\s]", "")
             .str.split(" ")
-            .list.eval(pl.element().filter(~pl.element().is_in(list(_SUFFIXES)) & (pl.element() != "")))
+            .list.eval(
+                pl.element().filter(
+                    ~pl.element().is_in(list(_SUFFIXES)) & (pl.element() != "")
+                )
+            )
             .list.join(" "),
             pl.col(team_col).str.to_uppercase(),
             pl.col(position_col).str.to_uppercase(),
@@ -367,7 +392,16 @@ def _resolve_sleeper_by_name(
         .unique(subset=["espn_id"], keep="none")  # drop any espn_id shared by two players
     )
     unknown = unknown.join(espn_lookup, on="espn_id", how="left")
-    by_espn = unknown.filter(pl.col("gsis_id").is_not_null() & ~pl.col("gsis_id").is_in(list(taken)))
+    by_espn = unknown.filter(
+        pl.col("gsis_id").is_not_null() & ~pl.col("gsis_id").is_in(list(taken))
+    )
+    # Sleeper ships duplicate entries for the same person (two rows, one espn_id -- De'Jon Harris
+    # is 7493 and 7504). Without this the same player is claimed twice and _prepare_sleeper picks
+    # between them arbitrarily. Prefer the row Sleeper still has on a team, then the lowest key,
+    # so the choice is the live account and is the same on every run.
+    by_espn = by_espn.sort(
+        ["gsis_id", "team", "sleeper_key"], nulls_last=True, maintain_order=True
+    ).unique(subset=["gsis_id"], keep="first", maintain_order=True)
     taken |= set(by_espn["gsis_id"].to_list())
 
     # --- 2. normalised name | team | position -------------------------------
@@ -408,7 +442,8 @@ def _resolve_sleeper_by_name(
     ).unique(subset=["sleeper_key"], keep="none")
 
     log.info(
-        "sleeper id recovery: %d rows had a gsis_id, recovered %d more (%d via espn_id, %d via name)",
+        "sleeper id recovery: %d rows had a gsis_id, recovered %d more"
+        " (%d via espn_id, %d via name)",
         known.height,
         recovered.height,
         by_espn.height,
@@ -419,10 +454,15 @@ def _resolve_sleeper_by_name(
 
     return (
         sleeper_raw.with_columns(_string_id(sleeper_raw, sleeper_id_col).alias("_sleeper_key"))
-        .join(recovered.rename({"sleeper_key": "_sleeper_key", "gsis_id": "_recovered_gsis"}),
-              on="_sleeper_key", how="left")
+        .join(
+            recovered.rename({"sleeper_key": "_sleeper_key", "gsis_id": "_recovered_gsis"}),
+            on="_sleeper_key",
+            how="left",
+        )
         .with_columns(
-            pl.coalesce(_string_id(sleeper_raw, "gsis_id"), pl.col("_recovered_gsis")).alias("gsis_id")
+            pl.coalesce(
+                _string_id(sleeper_raw, "gsis_id"), pl.col("_recovered_gsis")
+            ).alias("gsis_id")
         )
         .drop("_sleeper_key", "_recovered_gsis")
     )
@@ -450,7 +490,9 @@ def _prepare_sleeper(df: pl.DataFrame) -> pl.DataFrame:
     ).filter(pl.col("gsis_id").is_not_null() & pl.col("s_sleeper_id").is_not_null())
 
     return (
-        prepared.sort("s_team", nulls_last=True)
+        # s_sleeper_id breaks the ties s_team leaves, so a player with two Sleeper rows gets the
+        # same one on every run instead of whichever the unstable sort happened to surface.
+        prepared.sort(["s_team", "s_sleeper_id"], nulls_last=True, maintain_order=True)
         .unique(subset=["gsis_id"], keep="first", maintain_order=True)
         .drop("s_team")
     )
@@ -493,6 +535,8 @@ def _assemble(
         pl.col("p_draft_pick").alias("draft_pick"),
         _coalesce("p_status", "r_status").alias("status"),
         pl.lit(now).alias("updated_at"),
+        # Not a players column; consumed by _drop_ambiguous_ids and then discarded.
+        pl.col("_on_roster").fill_null(False).alias("on_current_roster"),
     )
 
 
@@ -504,13 +548,19 @@ def _drop_ambiguous_ids(frame: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, in
     ID fans out to two rows and double-counts the player. The most recently active player keeps
     the ID; everyone else loses it.
 
+    ``on_current_roster`` leads the ordering because ``last_season`` alone gets it backwards for
+    the players this module works hardest to include: someone carried in from the roster is not in
+    ``players.parquet`` yet, so his ``last_season`` is null, and a null sorts *below* a player last
+    seen in 1980. Ranking roster membership first hands the ID to the man playing this season.
+
     Returns:
         The cleaned frame and a per-column count of the IDs that were cleared.
     """
     ordered = frame.sort(
-        ["last_season", "rookie_season", "gsis_id"],
-        descending=[True, True, False],
+        ["on_current_roster", "last_season", "rookie_season", "gsis_id"],
+        descending=[True, True, True, False],
         nulls_last=True,
+        maintain_order=True,
     )
     cleared: dict[str, int] = {}
 
@@ -595,9 +645,9 @@ def build_players() -> IngestResult:
         roster_season = _latest_roster_season(con)
         if roster_season is None:
             log.warning("no raw_rosters files - sleeper_id/sportradar_id will be sparse")
-            rosters = _prepare_rosters(_no_rows())
+            rosters, n_roster_no_gsis = _prepare_rosters(_no_rows())
         else:
-            rosters = _prepare_rosters(
+            rosters, n_roster_no_gsis = _prepare_rosters(
                 _read(con, "SELECT * FROM raw_rosters WHERE season = ?", [roster_season])
             )
             log.info("raw_rosters season %d: %d players", roster_season, rosters.height)
@@ -613,7 +663,12 @@ def build_players() -> IngestResult:
 
         frame = _assemble(players, rosters, sleeper, now)
 
-        n_null_gsis = int(frame.select(pl.col("gsis_id").is_null().sum()).item())
+        # Roster rows with no gsis_id were already counted and dropped by _prepare_rosters; what
+        # is left here comes from players.parquet. Adding them keeps the reported figure equal to
+        # the number of source rows lost, not the number of surviving null-keyed rows.
+        n_null_gsis = (
+            int(frame.select(pl.col("gsis_id").is_null().sum()).item()) + n_roster_no_gsis
+        )
         frame = frame.filter(pl.col("gsis_id").is_not_null())
 
         before_dedupe = frame.height

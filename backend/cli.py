@@ -161,6 +161,30 @@ def defense(
 
 
 @app.command()
+def calibrate(
+    seasons: Annotated[str, typer.Option(help="Comma-separated; empty = configured seasons")] = "",
+) -> None:
+    """Re-tune the opponent-adjustment model per metric by walk-forward evaluation (§5.2)."""
+    from backend.models.adjust import calibrate_metrics
+
+    season_list = [int(s) for s in seasons.split(",") if s.strip()] or None
+    frame = calibrate_metrics(season_list)
+    if frame.is_empty():
+        console.print("[yellow]no facts to calibrate against — run `proplab backfill` first[/yellow]")
+        return
+
+    table = Table("metric", "unit", "ridge λ", "MSE reduction", "raw-rate baseline", "β",
+                  title="Opponent-adjustment calibration (walk-forward, out of sample)")
+    for r in frame.to_dicts():
+        table.add_row(
+            r["metric"], r["unit"], f"{r['ridge_lambda']:.0f}",
+            f"{r['mse_reduction_pct']:+.2f}%", f"{r['raw_mse_reduction_pct']:+.2f}%",
+            f"{r['beta']:.3f}",
+        )
+    console.print(table)
+
+
+@app.command()
 def rank(
     season: Annotated[int, typer.Option()] = 0,
     week: Annotated[int, typer.Option()] = 0,

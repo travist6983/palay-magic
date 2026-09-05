@@ -689,7 +689,8 @@ def ingest_players(force: bool = False) -> IngestResult:
 
     Returns:
         An :class:`~backend.ingest.base.IngestResult`. ``extra`` carries ``n_events``,
-        ``n_missing_gsis``, ``n_duplicate_gsis``, ``n_statuses`` and ``archive``.
+        ``n_missing_gsis``, ``n_recovered_gsis``, ``n_duplicate_gsis``, ``n_statuses`` and
+        ``archive``.
     """
     settings = get_settings()
     min_age = settings.sleeper_min_cache_age_hours

@@ -26,7 +26,18 @@ from backend.logging_setup import get_logger
 log = get_logger(__name__)
 
 # Designations that remove a player from the board entirely (§4).
-EXCLUDED_STATUSES: frozenset[str] = frozenset({"Out", "IR", "PUP", "Doubtful", "Injured Reserve"})
+EXCLUDED_STATUSES: frozenset[str] = frozenset(
+    {
+        "Out", "IR", "PUP", "Doubtful", "Injured Reserve",
+        # Sleeper's roster vocabulary: suspended, non-football injury, did not report, COVID.
+        # None of these players take a snap, so none belongs on a board (§4).
+        "Sus", "NFI", "DNR", "COV", "Physically Unable to Perform",
+    }
+)
+
+NON_DESIGNATIONS: frozenset[str] = frozenset({"NA", "N/A", "-", ""})
+"""Sleeper emits these where a healthy player has no designation. They are not injury statuses,
+and treating "NA" as one would push 95 healthy players off the board."""
 
 # Designations that keep a player on the board with a play probability shown (§4).
 UNCERTAIN_STATUSES: frozenset[str] = frozenset({"Questionable"})
@@ -287,10 +298,12 @@ def lookup(
 
     1. (status, practice, role, position group)
     2. (status, practice, role) collapsed across position groups
-    3. (status, practice) collapsed across roles -- the pooled number, which under-states a
+    3. (status, role) collapsed across practice statuses. This is the level that carries the
+       common case: before Wednesday of game week no practice report exists at all.
+    4. (status, practice) collapsed across roles -- the pooled number, which under-states a
        starter, so it is a last resort rather than the default
-    4. the documented fallback constants
-    5. healthy (1.0)
+    5. the documented fallback constants
+    6. healthy (1.0)
 
     A player with no designation at all is healthy. ``Out``, ``IR`` and ``PUP`` short-circuit to
     zero by rule (§4); ``Doubtful`` still reads its empirical cell, which lands near 1%.
@@ -303,6 +316,9 @@ def lookup(
         position_group: nflverse position group, for the most specific cell.
         gsis_id: carried through onto the result for logging.
     """
+    if report_status and report_status.strip() in NON_DESIGNATIONS:
+        report_status = None
+
     excluded = bool(report_status) and report_status in EXCLUDED_STATUSES
 
     if not report_status:
@@ -346,6 +362,21 @@ def lookup(
         ).fetchone()
         if row and row[0] >= MIN_CELL_OBSERVATIONS:
             return _result(row, "empirical:role")
+
+        # Marginalise over practice status, KEEPING the role. This is the case that matters most
+        # in practice: before Wednesday of game week there is no practice report at all, and the
+        # tiny "Unknown" practice cell is worse than no split. Collapsing across practice while
+        # holding role fixed keeps the dimension that actually moves the number (D11) -- a
+        # Questionable starter lands near 72% instead of the cross-role 61%.
+        row = con.execute(
+            "SELECT sum(n_observations), sum(n_played)::DOUBLE / nullif(sum(n_observations), 0), "
+            "       sum(mean_snap_share * n_played) / nullif(sum(n_played), 0) "
+            "FROM injury_play_rates "
+            "WHERE report_status = ? AND role_bucket = ? AND position_group = 'ALL'",
+            [report_status, role],
+        ).fetchone()
+        if row and row[0] and row[0] >= MIN_CELL_OBSERVATIONS:
+            return _result(row, "empirical:role_marginal")
 
         row = con.execute(
             "SELECT sum(n_observations), sum(n_played)::DOUBLE / nullif(sum(n_observations), 0), "

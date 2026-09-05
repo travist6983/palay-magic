@@ -81,6 +81,17 @@ def backfill(seasons: list[int] | None = None, force: bool = False) -> list[Stag
         _run("views", lambda: ensure_schema()[1]),
         _run("crosswalk.players", crosswalk.build_players),
     ]
+
+    # Calibration is expensive (it refits every ridge penalty at every week of history) and the
+    # penalties it produces are stable, so it belongs on backfill rather than the weekly refresh.
+    from backend.models.adjust import calibrate_metrics, compute_unit_facts
+    from backend.models.gamelog import build_all as build_gamelogs
+
+    stages += [
+        _run("gamelog.build", build_gamelogs, seasons),
+        _run("defense.facts", compute_unit_facts, seasons),
+        _run("defense.calibrate", lambda: calibrate_metrics(seasons).height),
+    ]
     return stages
 
 
@@ -114,8 +125,12 @@ def _model_stages(season: int, week: int) -> list[StageResult]:
     stages: list[StageResult] = []
 
     for name, importer in (
+        ("gamelog.stats", _gamelog_stage),
+        ("defense.facts", _facts_stage),
         ("defense.multipliers", _defense_stage),
         ("adjust.game_logs", _adjust_stage),
+        ("environment.team", _environment_stage),
+        ("injury.play_rates", _injury_stage),
         ("rank.top10", _rank_stage),
         ("project.week", _project_stage),
     ):
@@ -129,10 +144,34 @@ def _model_stages(season: int, week: int) -> list[StageResult]:
     return stages
 
 
+def _gamelog_stage():
+    from backend.models.gamelog import build_all
+
+    return lambda season, week: build_all()
+
+
+def _facts_stage():
+    from backend.models.adjust import compute_unit_facts
+
+    return lambda season, week: compute_unit_facts()
+
+
 def _defense_stage():
     from backend.models.adjust import compute_defense_multipliers
 
-    return compute_defense_multipliers
+    return lambda season, week: compute_defense_multipliers(season, week, rebuild_facts=False)
+
+
+def _environment_stage():
+    from backend.models.environment import build_team_environment
+
+    return build_team_environment
+
+
+def _injury_stage():
+    from backend.models.injury import compute_play_rates
+
+    return lambda season, week: compute_play_rates()
 
 
 def _adjust_stage():

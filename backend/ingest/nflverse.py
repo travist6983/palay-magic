@@ -627,9 +627,10 @@ def _record(results: list[IngestResult]) -> None:
     written = [r for r in results if r.ok and not r.skipped]
     skipped = [r for r in results if r.skipped]
     failed = [r for r in results if not r.ok]
-    # Rows on hand, not rows downloaded: a cache-fresh refresh writes nothing but the corpus is
-    # still 1.5M rows, and reporting the newly-written count made the badge read like the data
-    # had shrunk to whatever the last touched dataset happened to be.
+    # Rows on hand across the datasets this operation covered, not rows downloaded. Counting
+    # only what was written made a cache-fresh refresh report 0, which record_freshness turns
+    # into "keep the previous value" — so the badge showed a stale number left behind by
+    # whatever ran last (a single ingest_static("teams") left it reading 36).
     total = sum(r.n_rows for r in results if r.ok)
     detail = f"{len(written)} written, {len(skipped)} skipped, {len(failed)} failed" + (
         f"; failed: {', '.join(r.dataset for r in failed[:6])}" if failed else ""

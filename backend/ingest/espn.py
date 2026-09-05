@@ -36,6 +36,15 @@ these files need are::
 
 Verified 2026-09-05: both lines are **already present** in ``RAW_VIEWS``, so no edit is needed.
 This note stays so the owner of that module can confirm the file names have not drifted.
+
+TODO(owner of backend/pipeline.py): ``refresh()`` runs ``espn.ingest_injuries`` but **nothing
+calls** :func:`ingest_weather`, so ``data/raw/espn_weather.parquet`` is only ever produced by
+hand and ``raw_espn_weather`` goes stale the moment the week turns over. The stage it needs is::
+
+    _run("espn.weather", espn.ingest_weather, week_dates(state.season, state.week)),
+
+placed next to ``espn.injuries``, where ``week_dates`` is the Thu-Mon span of the target week.
+Not added here because this module does not own that file.
 """
 
 from __future__ import annotations
@@ -45,7 +54,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +106,7 @@ _RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 _HEADERS = {"Accept": "application/json"}
 
 _ATHLETE_ID_RE = re.compile(r"/athletes/(-?\d+)/injuries/")
+_SEASON_RE = re.compile(r"/seasons/(\d{4})/")
 
 # ESPN abbreviations that differ from the nflverse canon (verified against
 # nflreadpy.load_rosters([2026]): the Rams are "LA" and Washington is "WAS").
@@ -253,17 +263,22 @@ def _read_teams_cache(max_age_hours: float | None) -> list[dict[str, Any]] | Non
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        teams = payload["teams"]
+        teams = list(payload["teams"])
         fetched_at = datetime.fromisoformat(payload["fetched_at"])
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # A cache written by an older build (or edited by hand) can carry a naive timestamp.
+        # Subtracting it from an aware ``utcnow()`` raises, so normalise before comparing -- the
+        # age check has to live inside this guard or ``fetch_teams`` stops being no-raise.
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=UTC)
+        if max_age_hours is not None:
+            age_h = (utcnow() - fetched_at).total_seconds() / 3600.0
+            if age_h > max_age_hours:
+                return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         log.warning("ignoring unreadable ESPN team cache %s: %s", path, exc)
         return None
 
-    if max_age_hours is not None:
-        age_h = (utcnow() - fetched_at).total_seconds() / 3600.0
-        if age_h > max_age_hours:
-            return None
-    return list(teams)
+    return teams
 
 
 def _write_teams_cache(teams: list[dict[str, Any]]) -> None:
@@ -386,9 +401,19 @@ def _fetch_roster_index(client: httpx.Client, espn_team_id: str) -> dict[str, di
     return index
 
 
-def _fetch_athlete(client: httpx.Client, athlete_id: str) -> dict[str, Any]:
-    """Hydrate one athlete by id. Only used for injured players missing from the team roster."""
-    payload = _get_json(client, f"{CORE_API}/seasons/{utcnow().year}/athletes/{athlete_id}")
+def _fetch_athlete(client: httpx.Client, athlete_id: str, season: int) -> dict[str, Any] | None:
+    """Hydrate one athlete by id, for injured players missing from the team roster.
+
+    ``season`` must be the ESPN *season* the injury ``$ref`` belongs to, never the wall-clock
+    year: the NFL season spans two calendar years, and ``/seasons/{year+1}/athletes/{id}`` 404s
+    (verified 2026-09-05). Failure returns ``None`` — the row keeps its id, status and comment and
+    only loses the name/position, which is far better than dropping the injury.
+    """
+    try:
+        payload = _get_json(client, f"{CORE_API}/seasons/{season}/athletes/{athlete_id}")
+    except Exception as exc:  # noqa: BLE001 - a nameless row still beats no row
+        log.warning("could not hydrate ESPN athlete %s for season %s: %s", athlete_id, season, exc)
+        return None
     position = payload.get("position") or {}
     return {
         "player_name": payload.get("fullName") or payload.get("displayName"),
@@ -400,6 +425,16 @@ def _athlete_id_from_ref(ref: str) -> str | None:
     """Pull the athlete id out of an injury ``$ref`` without an extra request."""
     match = _ATHLETE_ID_RE.search(ref)
     return match.group(1) if match else None
+
+
+def _season_from_ref(ref: str) -> int:
+    """Read the ESPN season out of an injury ``$ref``, falling back to the calendar year.
+
+    Refs look like ``.../nfl/seasons/2026/athletes/4569497/injuries/636291``. The embedded season
+    is authoritative: in January the NFL season year is the *previous* calendar year.
+    """
+    match = _SEASON_RE.search(ref)
+    return int(match.group(1)) if match else utcnow().year
 
 
 def _parse_injury(
@@ -431,22 +466,56 @@ def _parse_injury(
     }
 
 
+def _hydrate_injury_ref(client: httpx.Client, ref: str) -> tuple[str, dict[str, Any] | None]:
+    """Hydrate one injury ``$ref``, returning ``(ref, None)`` instead of raising.
+
+    ESPN's collection carries records it will not serve — stale ids, and synthetic negative ids
+    such as ``injuries/-1934995`` seen live on 2026-09-05. Those come back 400/404, which
+    :data:`network_retry` correctly does *not* retry. Letting one escape would cost the whole
+    team, so the failure is isolated to the single record.
+    """
+    try:
+        return ref, _get_json(client, ref)
+    except Exception as exc:  # noqa: BLE001 - one bad record must not lose the other 60
+        log.warning("dropping unhydratable ESPN injury ref %s: %s", ref, exc)
+        return ref, None
+
+
 def _collect_team_injuries(
     client: httpx.Client,
     pool: ThreadPoolExecutor,
     team: dict[str, Any],
     fetched_at: datetime,
-) -> list[dict[str, Any]]:
-    """Page, hydrate and flatten one team's injuries. Raises so the caller can count failures."""
+) -> tuple[list[dict[str, Any]], int]:
+    """Page, hydrate and flatten one team's injuries.
+
+    Individual records that ESPN refuses to hydrate are dropped and counted rather than failing
+    the team. Listing the collection, or losing *every* record in it, still raises so the caller
+    counts the team as failed — otherwise a source-wide outage would look like "no injuries" and
+    quietly overwrite the previous Parquet with an empty frame.
+
+    Returns:
+        ``(rows, n_dropped_refs)``.
+    """
     espn_team_id = team["espn_id"]
     team_abbr = _nflverse_team(team.get("abbreviation"))
 
     refs = _list_injury_refs(client, espn_team_id)
     if not refs:
-        return []
+        return [], 0
 
     roster = _fetch_roster_index(client, espn_team_id)
-    records = list(pool.map(lambda r: (r, _get_json(client, r)), refs))
+    hydrated = list(pool.map(lambda r: _hydrate_injury_ref(client, r), refs))
+    records = [(ref, rec) for ref, rec in hydrated if rec is not None]
+    n_dropped = len(hydrated) - len(records)
+    if not records:
+        raise ConnectionError(
+            f"team {team_abbr}: none of the {len(refs)} injury refs could be hydrated"
+        )
+    if n_dropped:
+        log.warning(
+            "team %s: dropped %d/%d unhydratable injury refs", team_abbr, n_dropped, len(refs)
+        )
 
     missing = sorted(
         {
@@ -457,14 +526,18 @@ def _collect_team_injuries(
         }
     )
     if missing:
-        log.debug("team %s: hydrating %d off-roster athletes", team_abbr, len(missing))
-        hydrated = list(pool.map(lambda a: _fetch_athlete(client, a), missing))
-        for athlete_id, info in zip(missing, hydrated, strict=True):
-            roster[athlete_id] = info
+        season = _season_from_ref(records[0][0])
+        log.debug(
+            "team %s: hydrating %d off-roster athletes (season %s)", team_abbr, len(missing), season
+        )
+        athletes = list(pool.map(lambda a: _fetch_athlete(client, a, season), missing))
+        for athlete_id, info in zip(missing, athletes, strict=True):
+            if info is not None:
+                roster[athlete_id] = info
 
     rows = [_parse_injury(rec, ref, team_abbr, roster, fetched_at) for ref, rec in records]
     log.debug("team %s: %d injuries over %d refs", team_abbr, len(rows), len(refs))
-    return rows
+    return rows, n_dropped
 
 
 def _load_espn_to_gsis() -> dict[str, tuple[str, str | None]]:
@@ -492,21 +565,26 @@ def _load_espn_to_gsis() -> dict[str, tuple[str, str | None]]:
     return {str(espn_id): (str(gsis_id), sleeper_id) for espn_id, gsis_id, sleeper_id in rows}
 
 
-def _upsert_injury_status(df: pl.DataFrame) -> tuple[int, int]:
+def _upsert_injury_status(df: pl.DataFrame) -> tuple[int, int, int]:
     """Upsert the mapped ESPN rows into ``injury_status`` with ``source='espn'``.
 
     Rows whose ``espn_athlete_id`` has no ``players.espn_id`` match stay in the Parquet file and
     are skipped here; the counts are reported so the caller can surface them.
 
+    ``n_unmapped`` counts *only* genuine crosswalk misses — players ESPN knows about that
+    ``players`` does not. Rows collapsed because one athlete carried several injury records, and
+    rows with no resolvable athlete id at all, are reported separately: folding them into
+    "unmapped" makes the module's own health metric read as a much worse join than it is.
+
     Returns:
-        ``(n_written, n_unmapped)``.
+        ``(n_written, n_unmapped, n_collapsed)``.
     """
     if df.is_empty():
-        return 0, 0
+        return 0, 0, 0
 
     crosswalk = _load_espn_to_gsis()
     if not crosswalk:
-        return 0, df.height
+        return 0, df.height, 0
 
     # One row per player: the most recent record wins.
     latest = (
@@ -542,10 +620,11 @@ def _upsert_injury_status(df: pl.DataFrame) -> tuple[int, int]:
             )
         )
 
-    # Duplicate records for one athlete, plus any record with no resolvable athlete id.
-    unmapped += df.height - latest.height
+    # Duplicate records for one athlete, plus any record with no resolvable athlete id. These are
+    # deliberately *not* counted as unmapped: the player is usually mapped, just once.
+    collapsed = df.height - latest.height
     if not params:
-        return 0, unmapped
+        return 0, unmapped, collapsed
 
     with connect() as con:
         con.executemany(
@@ -569,7 +648,7 @@ def _upsert_injury_status(df: pl.DataFrame) -> tuple[int, int]:
             params,
         )
 
-    return len(params), unmapped
+    return len(params), unmapped, collapsed
 
 
 def _parse_timestamp(value: str | None) -> datetime:
@@ -587,17 +666,22 @@ def ingest_injuries(max_teams: int | None = None) -> IngestResult:
     """Pull every team's ESPN injury list, write Parquet, and upsert into ``injury_status``.
 
     For each team we page through the ``/injuries`` ``$ref`` collection, hydrate every reference,
-    and resolve player names and positions from that team's roster. Teams that fail are logged and
-    skipped: whatever succeeded is still written and the freshness badge is downgraded to yellow
-    rather than red, because partial ESPN data is far better than none (D8). If *every* team
-    fails, the previous Parquet is left in place rather than truncated to zero rows.
+    and resolve player names and positions from that team's roster. Loss is isolated at the
+    smallest level that still means something: a single unhydratable record costs that record, a
+    team whose collection cannot be listed costs that team, and whatever survives is still written
+    with the freshness badge downgraded to yellow rather than red, because partial ESPN data is
+    far better than none (D8). If *every* team fails, the previous Parquet is left in place rather
+    than truncated to zero rows.
 
     Args:
-        max_teams: only process the first N teams. Handy for smoke tests; ``None`` means all 32.
+        max_teams: only process the first N teams. Handy for smoke tests, but note it **replaces**
+            the Parquet with just those teams; ``None`` means all 32.
 
     Returns:
         An :class:`IngestResult` whose ``extra`` carries ``n_teams``, ``n_failed_teams``,
-        ``n_mapped`` (rows written to ``injury_status``) and ``n_unmapped``.
+        ``failed_teams``, ``n_dropped_refs``, ``n_mapped`` (rows written to ``injury_status``),
+        ``n_unmapped`` (players absent from the crosswalk) and ``n_collapsed`` (extra records for
+        a player who already has a row).
     """
     teams = fetch_teams()
     if not teams:
@@ -615,19 +699,21 @@ def ingest_injuries(max_teams: int | None = None) -> IngestResult:
     fetched_at = utcnow()
     rows: list[dict[str, Any]] = []
     failed: list[str] = []
+    n_dropped_refs = 0
     lock = threading.Lock()
 
     with _make_client() as client, ThreadPoolExecutor(max_workers=_MAX_IN_FLIGHT) as pool:
         for team in teams:
             label = team.get("abbreviation") or team["espn_id"]
             try:
-                team_rows = _collect_team_injuries(client, pool, team, fetched_at)
+                team_rows, team_dropped = _collect_team_injuries(client, pool, team, fetched_at)
             except Exception as exc:  # noqa: BLE001 - one bad team must not lose the other 31
                 log.warning("ESPN injuries failed for team %s: %s", label, exc)
                 failed.append(str(label))
                 continue
             with lock:
                 rows.extend(team_rows)
+                n_dropped_refs += team_dropped
 
     if failed and not rows:
         # Total failure: keep the previous good Parquet rather than replacing it with nothing.
@@ -645,21 +731,26 @@ def ingest_injuries(max_teams: int | None = None) -> IngestResult:
     df = pl.DataFrame(rows, schema={c: pl.Utf8 for c in _INJURY_COLUMNS})
     path = write_parquet_atomic(df, raw_path(INJURIES_FILE))
 
-    n_mapped, n_unmapped = _upsert_injury_status(df)
+    n_mapped, n_unmapped, n_collapsed = _upsert_injury_status(df)
 
     detail = (
         f"{len(teams) - len(failed)}/{len(teams)} teams, "
         f"{n_mapped} mapped to gsis_id, {n_unmapped} unmapped"
     )
+    if n_dropped_refs:
+        detail += f", {n_dropped_refs} refs dropped"
     log.info("ESPN injuries: %d rows (%s)", df.height, detail)
 
     # Stamp the success first so the badge has a fresh last_success_at, then downgrade to yellow
-    # if some teams were lost. ``record_freshness`` derives yellow from "ok=False, success recent".
+    # if anything was lost. ``record_freshness`` derives yellow from "ok=False, success recent".
     record_freshness(SOURCE, ok=True, detail=detail, n_rows=df.height)
-    if failed:
-        record_freshness(
-            SOURCE, ok=False, detail=f"partial: {len(failed)} teams failed ({', '.join(failed)})"
-        )
+    if failed or n_dropped_refs:
+        partial = []
+        if failed:
+            partial.append(f"{len(failed)} teams failed ({', '.join(failed)})")
+        if n_dropped_refs:
+            partial.append(f"{n_dropped_refs} injury refs unhydratable")
+        record_freshness(SOURCE, ok=False, detail="partial: " + "; ".join(partial))
 
     return IngestResult(
         source=SOURCE,
@@ -672,8 +763,10 @@ def ingest_injuries(max_teams: int | None = None) -> IngestResult:
             "n_teams": len(teams),
             "n_failed_teams": len(failed),
             "failed_teams": failed,
+            "n_dropped_refs": n_dropped_refs,
             "n_mapped": n_mapped,
             "n_unmapped": n_unmapped,
+            "n_collapsed": n_collapsed,
         },
     )
 
