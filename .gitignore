@@ -1,0 +1,24 @@
+# data
+data/
+!data/.gitkeep
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+uv.lock
+
+# node
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# env
+.env
+.env.local
+
+# os
+.DS_Store

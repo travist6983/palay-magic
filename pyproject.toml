@@ -1,0 +1,56 @@
+[project]
+name = "proplab"
+version = "0.1.0"
+description = "Local NFL player-prop projection app: usage x efficiency, opponent-adjusted, distributional."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "nflreadpy>=0.1.5",
+    "polars>=1.17",
+    "pandas>=2.2",
+    "pyarrow>=18",
+    "numpy>=2.1",
+    "scipy>=1.14",
+    "statsmodels>=0.14",
+    "duckdb>=1.1",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "httpx>=0.27",
+    "tenacity>=9.0",
+    "typer>=0.15",
+    "rich>=13.9",
+    "python-dotenv>=1.0",
+    "anthropic>=0.40",
+]
+
+[project.scripts]
+proplab = "backend.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["."]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
