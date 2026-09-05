@@ -140,9 +140,9 @@ export function BoardPage({ position: positionProp }: BoardPageProps) {
       <p className="text-[11px] leading-relaxed text-chalk-faint">
         Rank is projected value for the week. Every 2026 projection is built on prior-season game
         logs, so the chips on a player — new team, new coach, a moved pass rate, thin history — mark
-        exactly where that baseline no longer describes the player. Matchup is the opponent
-        multiplier for the position&apos;s headline volume metric (1 = softest defence). Intervals
-        are p25–p75.
+        exactly where that baseline no longer describes the player. Matchup is the defensive
+        adjustment already applied to the first projection in the row: 1.00 is a league-average
+        defence, and rank 1 of 32 is the softest. Intervals are p25–p75.
       </p>
     </section>
   )

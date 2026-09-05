@@ -6,7 +6,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link, NavLink } from 'react-router-dom'
 import { api } from '../lib/api'
-import { relativeTime, weekLabel } from '../lib/format'
+import { localStamp, relativeTime, weekLabel } from '../lib/format'
 import type { Meta } from '../lib/types'
 import { FreshnessBadges } from './FreshnessBadges'
 import { PlayerSearch } from './PlayerSearch'
@@ -63,14 +63,16 @@ export function PriorSeasonBanner({ meta }: PriorSeasonBannerProps) {
 
 export function Header({ className = '' }: HeaderProps) {
   // networkMode 'always': the API is on 127.0.0.1, so the browser's public-internet online
-  // heuristic must not pause the fetch (it would leave the whole shell without a week or status).
+  // heuristic must not gate the first attempt (it would leave the shell without a week or status).
+  // Retries still pause while the tab is hidden, so every state below is rendered explicitly.
   const { data: meta, isError, fetchStatus } = useQuery({
     queryKey: ['meta'],
     queryFn: api.meta,
     networkMode: 'always',
   })
 
-  const positions = meta && meta.positions.length > 0 ? meta.positions : POSITIONS
+  const positions = meta?.positions?.length ? meta.positions : POSITIONS
+  const failedStages = meta?.failed_stages ?? []
 
   return (
     <header className={`sticky top-0 z-30 border-b border-ink-line bg-ink/95 backdrop-blur ${className}`}>
@@ -88,7 +90,7 @@ export function Header({ className = '' }: HeaderProps) {
             ) : fetchStatus === 'paused' ? (
               <span
                 className="text-warn"
-                title="React Query paused the request (browser offline or tab unfocused); it retries on its own."
+                title="React Query paused the retry (the tab is hidden, or the browser reports itself offline); it resumes on its own."
               >
                 status paused — will retry
               </span>
@@ -101,8 +103,8 @@ export function Header({ className = '' }: HeaderProps) {
               <span
                 className="text-chalk-faint"
                 title={[
-                  `last refresh: ${meta.last_refresh_at ?? 'never'}`,
-                  meta.last_refresh_seconds === null
+                  `last refresh: ${localStamp(meta.last_refresh_at)}`,
+                  meta.last_refresh_seconds == null || !Number.isFinite(meta.last_refresh_seconds)
                     ? null
                     : `took ${meta.last_refresh_seconds.toFixed(1)}s`,
                   `week source: ${meta.state_source}`,
@@ -113,7 +115,7 @@ export function Header({ className = '' }: HeaderProps) {
               >
                 refreshed {relativeTime(meta.last_refresh_at)}
               </span>
-              {meta.odds_budget_remaining !== null && (
+              {meta.odds_budget_remaining != null && (
                 <span className="num text-chalk-faint" title="The Odds API requests left this month">
                   odds {meta.odds_budget_remaining}
                 </span>
@@ -123,7 +125,7 @@ export function Header({ className = '' }: HeaderProps) {
         </div>
 
         <div className="ml-auto flex flex-1 items-center justify-end gap-4">
-          {meta && <FreshnessBadges sources={meta.sources} className="justify-end" />}
+          {meta && <FreshnessBadges sources={meta.sources ?? []} className="justify-end" />}
           <PlayerSearch className="w-56 shrink-0" />
         </div>
       </div>
@@ -142,15 +144,15 @@ export function Header({ className = '' }: HeaderProps) {
 
       {meta?.all_history_prior_season && <PriorSeasonBanner meta={meta} />}
 
-      {meta && meta.failed_stages.length > 0 && (
+      {meta && failedStages.length > 0 && (
         <div className="border-b border-bad/30 bg-bad/[0.07]">
           <div className={`${CONTAINER} flex flex-wrap items-baseline gap-x-2 gap-y-1 py-1.5`}>
             <span className="chip border border-bad/40 bg-bad/10 text-bad">Refresh failed</span>
             <span className="text-xs text-chalk-dim">
-              {meta.failed_stages.length} stage{meta.failed_stages.length === 1 ? '' : 's'} did not
-              complete on the last refresh — data below may be stale:
+              {failedStages.length} stage{failedStages.length === 1 ? '' : 's'} did not complete
+              on the last refresh — data below may be stale:
             </span>
-            {meta.failed_stages.map((stage) => (
+            {failedStages.map((stage) => (
               <span key={stage} className="chip bg-ink-line text-chalk-dim">
                 {stage}
               </span>

@@ -136,7 +136,12 @@ def board(season: int, week: int, position: str) -> dict[str, Any]:
         bucket[key] = r
 
     # The opponent multiplier shown on the board is the one for the position's primary stat.
+    # That metric is NOT always the projected stat: a kicker's headline is kicking points but the
+    # matchup metric is FG attempts allowed, and a linebacker's is tackles but the metric is
+    # offensive plays run. The board therefore ships the metric's own name so the UI can say what
+    # the number actually measures instead of inferring it from the projection label.
     primary_metric = get_spec(position, headline_stats[0]).defense_metric
+    primary_spec = METRIC_BY_KEY.get(primary_metric)
     mults = {
         (r["team"]): (r["multiplier"], r["rank"])
         for r in query_df(
@@ -181,6 +186,8 @@ def board(season: int, week: int, position: str) -> dict[str, Any]:
                 "changed_coach": bool(r["changed_coach"]),
                 "pass_rate_shift": r["pass_rate_shift"] or 0.0,
                 "opponent_multiplier": mult, "opponent_rank": rank,
+                "opponent_metric": primary_metric,
+                "opponent_metric_label": primary_spec.label if primary_spec else primary_metric,
                 "headline": headline,
             }
         )

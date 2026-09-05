@@ -15,7 +15,7 @@ import {
   type ColumnDef,
   type SortingState,
 } from '@tanstack/react-table'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { formatOdds } from '../lib/distributions'
 import { pct, signed, stat as fmtStat } from '../lib/format'
@@ -32,6 +32,10 @@ export interface BoardTableProps {
 const PASS_RATE_FLAG_THRESHOLD = 0.03
 
 const RIGHT_ALIGNED = new Set(['rank'])
+
+/** A board is a ranked list, so it always opens in rank order. Module-level so the reset is a no-op
+ *  when the sorting state already holds it. */
+const DEFAULT_SORTING: SortingState = [{ id: 'rank', desc: false }]
 
 function alignClass(columnId: string): string {
   return RIGHT_ALIGNED.has(columnId) || columnId.startsWith('h:') ? 'text-right' : 'text-left'
@@ -166,7 +170,7 @@ export function ProjectionCell({ projection }: ProjectionCellProps) {
 // --- table -----------------------------------------------------------------
 
 export function BoardTable({ rows, className }: BoardTableProps) {
-  const [sorting, setSorting] = useState<SortingState>([{ id: 'rank', desc: false }])
+  const [sorting, setSorting] = useState<SortingState>(DEFAULT_SORTING)
 
   /** Headline stats vary by position and arrive in the payload, so the columns are derived. */
   const headlineStats = useMemo(() => {
@@ -180,6 +184,18 @@ export function BoardTable({ rows, className }: BoardTableProps) {
   }, [rows])
 
   const primaryLabel = headlineStats[0]?.label ?? null
+
+  /**
+   * The projection columns are named after the payload's stats, so a sort on one of them does not
+   * survive a move to another position. TanStack drops a sort on a column that no longer exists
+   * without telling anyone, which leaves the table with NO sorted column -- every header reading
+   * aria-sort="none" and no marker -- even though the rows are still in rank order. Put the board
+   * back on its default whenever the column set changes.
+   */
+  const statSignature = headlineStats.map((s) => s.key).join(',')
+  useEffect(() => {
+    setSorting(DEFAULT_SORTING)
+  }, [statSignature])
 
   const columns = useMemo<ColumnDef<BoardRow>[]>(() => {
     const base: ColumnDef<BoardRow>[] = [
@@ -260,7 +276,7 @@ export function BoardTable({ rows, className }: BoardTableProps) {
             multiplier={row.original.opponent_multiplier}
             rank={row.original.opponent_rank}
             opponent={row.original.opponent}
-            statLabel={primaryLabel}
+            statLabel={row.original.opponent_metric_label ?? primaryLabel}
           />
         ),
       },

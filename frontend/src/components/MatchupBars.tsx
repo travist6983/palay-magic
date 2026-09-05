@@ -124,7 +124,9 @@ export function MatchupBars({ matchup, opponent, className }: MatchupBarsProps) 
         The right-hand number is error actually removed, not importance.{' '}
         {worthwhile.length === 0
           ? 'None of these signals removes even 1% of the week-to-week error here: the matchup is close to noise for this player, and volume is the whole story.'
-          : `Only ${worthwhile.length} of ${rows.length} clear 1%. A soft matchup shifts the projection a few percent; it does not decide the game.`}
+          : worthwhile.length === rows.length
+            ? `All ${rows.length} clear 1%. A soft matchup shifts the projection a few percent; it does not decide the game.`
+            : `Only ${worthwhile.length} of ${rows.length} clear 1%. A soft matchup shifts the projection a few percent; it does not decide the game.`}
       </p>
     </section>
   )

@@ -62,6 +62,8 @@ export function hasMeaningfulUnconditional(projections: Projection[]): boolean {
 
 /** Integer-valued stats print as integers; longest_* and derived means keep a decimal. */
 function quantileText(dist: DistributionParams, value: number): string {
+  // Math.round would turn a missing quantile into the string "NaN"; a gap prints as a dash.
+  if (!Number.isFinite(value)) return '—'
   return dist.integer_valued ? String(Math.round(value)) : fmtStat(value)
 }
 

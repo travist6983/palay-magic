@@ -63,6 +63,12 @@ export function bandColour(value: number | null | undefined): string {
   return 'text-bad'
 }
 
+/** A fixed-precision number that degrades to an em dash instead of printing "NaN". */
+function fixed(value: number | null | undefined, digits: number): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  return value.toFixed(digits)
+}
+
 /** A calibrated P(over median) scores 0.25. Much worse means the median is not the median. */
 function brierColour(value: number): string {
   if (!Number.isFinite(value)) return 'text-chalk-faint'
@@ -139,7 +145,7 @@ const COLUMNS = [
   }),
   column.accessor('brier', {
     header: 'Brier',
-    cell: (c) => <span className={`num ${brierColour(c.getValue())}`}>{c.getValue().toFixed(3)}</span>,
+    cell: (c) => <span className={`num ${brierColour(c.getValue())}`}>{fixed(c.getValue(), 3)}</span>,
   }),
 ]
 
@@ -199,9 +205,12 @@ function SkeletonRows({ rows }: { rows: number }) {
 /** The calibration section of the model-health page: headline numbers, caveats, and the table. */
 export function CalibrationTable({ className = '' }: CalibrationTableProps) {
   const [sorting, setSorting] = useState<SortingState>([{ id: 'position', desc: false }])
+  // networkMode 'always': the API is on 127.0.0.1, so the browser's public-internet online
+  // heuristic must not pause the fetch (it would leave the section on a skeleton forever).
   const { data, error, isPending, isPaused, isFetching, refetch } = useQuery({
     queryKey: ['calibration'],
     queryFn: () => api.calibration(),
+    networkMode: 'always',
   })
 
   const rows = useMemo(() => data?.rows ?? [], [data])

@@ -16,7 +16,7 @@ export interface ModelHealthPageProps {
 
 export function ModelHealthPage({ initialPosition = 'WR' }: ModelHealthPageProps) {
   return (
-    <div className="mx-auto max-w-[1400px] space-y-4 px-4 py-4">
+    <div className="space-y-4">
       <header>
         <h1 className="text-lg font-semibold tracking-tight text-chalk">Model health</h1>
         <p className="mt-1 max-w-3xl text-xs leading-relaxed text-chalk-dim">

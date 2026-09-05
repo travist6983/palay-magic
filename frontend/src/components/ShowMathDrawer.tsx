@@ -34,6 +34,8 @@ export function formatMathValue(value: number | null): string {
 
 /** Quantiles of an integer-valued stat are counts, not measurements. */
 function formatQuantile(dist: DistributionParams, value: number): string {
+  // Math.round(NaN) stringifies to "NaN"; a missing quantile reads as a dash like every other gap.
+  if (!Number.isFinite(value)) return '—'
   return dist.integer_valued ? String(Math.round(value)) : formatMathValue(value)
 }
 

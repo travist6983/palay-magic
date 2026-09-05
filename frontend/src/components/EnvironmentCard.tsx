@@ -24,7 +24,10 @@ interface Field {
 export function EnvironmentCard({ environment, team, opponent, className }: EnvironmentCardProps) {
   const env = environment
   const site = env.is_home === null ? 'vs' : env.is_home ? 'vs' : 'at'
-  const degraded = env.odds_source !== null && !env.odds_source.includes('odds-api')
+  // A missing source is not a live one: the ingest writes games with no line at all as null (D4),
+  // and those must not get the green "live market" dot.
+  const missingOdds = env.odds_source === null
+  const degraded = !env.odds_source?.includes('odds-api')
 
   const fields: Field[] = [
     {
@@ -108,13 +111,15 @@ export function EnvironmentCard({ environment, team, opponent, className }: Envi
         <span
           className={`ml-auto flex items-center gap-1 ${degraded ? 'text-warn' : 'text-chalk-faint'}`}
           title={
-            degraded
-              ? 'Live odds were unavailable, so the spread and total come from the nflverse schedule file (D4). The numbers are real, just not the current market.'
-              : 'Spread and total from the live odds feed.'
+            missingOdds
+              ? 'No line was recorded for this game, so the spread, total and everything derived from them are missing.'
+              : degraded
+                ? 'Live odds were unavailable, so the spread and total come from the nflverse schedule file (D4). The numbers are real, just not the current market.'
+                : 'Spread and total from the live odds feed.'
           }
         >
           <span className={`inline-block h-1.5 w-1.5 rounded-full ${degraded ? 'bg-warn' : 'bg-good'}`} />
-          {env.odds_source ?? 'source unknown'}
+          {env.odds_source ?? 'no line'}
         </span>
       </div>
     </section>

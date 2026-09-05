@@ -102,6 +102,11 @@ class BoardRow(BaseModel):
     pass_rate_shift: float = 0.0
     opponent_multiplier: float = 1.0
     opponent_rank: int | None = None
+    opponent_metric: str | None = None
+    opponent_metric_label: str | None = None
+    """What the board's multiplier actually measures. Not always the projected stat: a kicker's
+    headline is kicking points but the matchup metric is FG attempts allowed."""
+
     headline: list[ProjectionOut] = Field(default_factory=list)
 
 

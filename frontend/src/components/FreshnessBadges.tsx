@@ -4,7 +4,7 @@
  * and whatever the loader had to say about it.
  */
 
-import { freshnessColour, relativeTime } from '../lib/format'
+import { freshnessColour, localStamp, relativeTime } from '../lib/format'
 import type { SourceStatus } from '../lib/types'
 
 export interface FreshnessBadgesProps {
@@ -16,20 +16,22 @@ function tooltip(s: SourceStatus): string {
   const lines: string[] = [
     `${s.source} — ${s.status}`,
     s.last_success_at
-      ? `last success: ${s.last_success_at} (${relativeTime(s.last_success_at)})`
+      ? `last success: ${localStamp(s.last_success_at)} (${relativeTime(s.last_success_at)})`
       : 'last success: never',
-    s.age_hours === null ? 'age: unknown' : `age: ${s.age_hours.toFixed(1)}h`,
-    s.rows === null ? 'rows: n/a' : `rows: ${s.rows.toLocaleString()}`,
+    s.age_hours == null || !Number.isFinite(s.age_hours)
+      ? 'age: unknown'
+      : `age: ${s.age_hours.toFixed(1)}h`,
+    s.rows == null || !Number.isFinite(s.rows) ? 'rows: n/a' : `rows: ${s.rows.toLocaleString()}`,
   ]
   if (s.last_attempt_at && s.last_attempt_at !== s.last_success_at) {
-    lines.push(`last attempt: ${s.last_attempt_at}`)
+    lines.push(`last attempt: ${localStamp(s.last_attempt_at)}`)
   }
   if (s.detail) lines.push(`detail: ${s.detail}`)
   return lines.join('\n')
 }
 
 export function FreshnessBadges({ sources, className = '' }: FreshnessBadgesProps) {
-  if (sources.length === 0) return null
+  if (!sources || sources.length === 0) return null
   const degraded = sources.filter((s) => s.status !== 'green').length
   return (
     <div

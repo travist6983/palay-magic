@@ -96,6 +96,12 @@ export function multiplierScale(multiplier: number, higherIsSofter: boolean): st
   return 'text-chalk-dim'
 }
 
+/** A fixed-precision number that degrades to an em dash instead of printing "NaN". */
+function fixed(value: number | null | undefined, digits: number): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  return value.toFixed(digits)
+}
+
 /** Rates run down to 0.02, so the shared stat() formatter is too coarse below 1. */
 function rawValue(value: number): string {
   if (!Number.isFinite(value)) return '—'
@@ -135,9 +141,9 @@ function columns(metric: MetricOption) {
         <span
           className={`num inline-block rounded px-1.5 py-0.5 ${multiplierScale(c.getValue(), metric.higherIsSofter)}`}
         >
-          <span className="inline-block w-11 text-right">{c.getValue().toFixed(3)}</span>
+          <span className="inline-block w-11 text-right">{fixed(c.getValue(), 3)}</span>
           <span className="ml-2 inline-block w-12 text-right text-[11px] opacity-80">
-            {multiplierLabel(c.getValue())}
+            {Number.isFinite(c.getValue()) ? multiplierLabel(c.getValue()) : '—'}
           </span>
         </span>
       ),
@@ -195,12 +201,20 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
     { id: 'multiplier', desc: metric.higherIsSofter },
   ])
 
+  // networkMode 'always': the API is on 127.0.0.1, so the browser's public-internet online
+  // heuristic must not pause the fetch (it would leave the section on a skeleton forever).
   const { data, error, isPending, isPaused, isFetching, refetch } = useQuery({
     queryKey: ['defense', position, metric.key],
     queryFn: () => api.defense(position, metric.key),
     placeholderData: keepPreviousData,
+    networkMode: 'always',
   })
 
+  // keepPreviousData hands back the previously selected metric's table while the new one is in
+  // flight. Those rows are on a different scale and a possibly opposite direction, so nothing that
+  // names or grades the current metric may read from them, and they are never left on screen once
+  // the replacement has stopped loading.
+  const matches = data?.metric === metric.key
   const rows = useMemo(() => data?.rows ?? [], [data])
   const cols = useMemo(() => columns(metric), [metric])
   const table = useReactTable({
@@ -224,7 +238,7 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
     setSorting([{ id: 'multiplier', desc: next.higherIsSofter }])
   }
 
-  const reduction = data?.mse_reduction_pct ?? null
+  const reduction = matches ? (data?.mse_reduction_pct ?? null) : null
 
   return (
     <section className={`card ${className}`}>
@@ -234,7 +248,7 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
             Opponent adjustment — all 32 defences
           </h2>
           <div className="num text-xs text-chalk-faint">
-            {data ? `${data.season} · week ${data.week}` : 'loading…'}
+            {matches && data ? `${data.season} · week ${data.week}` : error ? '—' : 'loading…'}
             {isPaused ? (
               <span className="ml-2 text-warn">paused</span>
             ) : isFetching ? (
@@ -286,10 +300,10 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
         ) : null}
 
         <div className="mt-3 text-xs leading-relaxed text-chalk-dim">
-          <span className="text-chalk">{data?.label ?? metric.label}</span> — adjusts{' '}
+          <span className="text-chalk">{metric.label}</span> — adjusts{' '}
           {metric.drives.toLowerCase()}.{' '}
           <span className={`num font-medium ${reductionColour(reduction)}`}>
-            {reduction === null ? '—' : `${reduction.toFixed(1)}%`} MSE reduction
+            {fixed(reduction, 1)}{reduction === null ? '' : '%'} MSE reduction
           </span>
           : how much of the out-of-sample error in this metric the adjustment removes versus
           ignoring the matchup entirely, measured walk-forward. Under about 1% the matchup carries
@@ -298,7 +312,7 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
         </div>
       </header>
 
-      {error && !data ? (
+      {error && !matches ? (
         <div className="px-4 py-6">
           <div className="text-sm font-medium text-bad">Could not load the defence table</div>
           <p className="mt-2 text-xs text-chalk-dim">
@@ -314,7 +328,7 @@ export function DefenseTable({ initialPosition = 'WR', className = '' }: Defense
             Retry
           </button>
         </div>
-      ) : isPaused && !data ? (
+      ) : isPaused && !matches ? (
         <div className="px-4 py-6">
           <div className="text-sm font-medium text-chalk">Paused — the table has not loaded</div>
           <p className="mt-2 text-xs text-chalk-dim">

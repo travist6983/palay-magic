@@ -45,7 +45,8 @@ export function PlayerSearch({
     queryFn: () => api.search(query),
     enabled: query.length >= MIN_QUERY,
     staleTime: 60_000,
-    // The backend is local; do not let the browser's online heuristic pause the lookup.
+    // The backend is local, so the browser's online heuristic must not gate the first attempt.
+    // (It does not stop retries pausing while the tab is hidden -- hence the paused branch below.)
     networkMode: 'always',
   })
 
@@ -105,6 +106,10 @@ export function PlayerSearch({
       return
     }
     if (e.key === 'Enter') {
+      // Escape and outside-clicks close the panel while the cached hits stay in memory. Without
+      // this guard Enter still fired the highlighted row, teleporting the user to a player they
+      // had just dismissed.
+      if (!showPanel) return
       const hit = hits[cursor]
       if (hit) {
         e.preventDefault()
@@ -158,7 +163,12 @@ export function PlayerSearch({
           {isError ? (
             <div className="px-3 py-2 text-xs text-bad">Search unavailable.</div>
           ) : fetchStatus === 'paused' ? (
-            <div className="px-3 py-2 text-xs text-warn">Search paused — the browser is offline.</div>
+            <div
+              className="px-3 py-2 text-xs text-warn"
+              title="React Query pauses retries while the tab is hidden (and while the browser reports itself offline); it resumes on its own."
+            >
+              Search paused — retrying shortly.
+            </div>
           ) : data === undefined ? (
             <div className="px-3 py-2 text-xs text-chalk-faint">Searching…</div>
           ) : hits.length === 0 ? (

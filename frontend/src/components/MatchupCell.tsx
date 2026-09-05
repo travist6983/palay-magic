@@ -1,15 +1,21 @@
 /**
- * Opponent matchup: how much more (or less) of this stat the opponent allows than a league-average
- * defence, plus where that puts them among the 32.
+ * Opponent matchup: the defensive adjustment already applied to the row's first headline
+ * projection, plus where that puts the opponent among the 32.
  *
  * Rank 1 is the SOFTEST defence for the stat (the highest multiplier), so a low rank and a green
  * chip mean the same thing. The multiplier is already the number the projection was multiplied by.
+ *
+ * It is NOT a rate of the projected stat that the defence gives up, and it must not be described as
+ * one: backend/models/stats.py maps each stat to the defence metric that adjusts it, and for two of
+ * the six boards that metric measures something else entirely -- LB is scaled by offensive plays
+ * allowed and K by field-goal attempts allowed. "Allows 0.5% more tackles + assists" would be flatly
+ * untrue on the LB board.
  */
 
 import { multiplierColour, multiplierLabel } from '../lib/format'
 
 export interface MatchupCellProps {
-  /** Defensive multiplier for the position's headline volume metric. 1.00 = league average. */
+  /** The defensive multiplier that adjusts the position's first headline stat. 1.00 = league average. */
   multiplier: number
   /** Defensive rank, 1 = softest. Null when the opponent has no measured defence yet. */
   rank: number | null
@@ -54,13 +60,17 @@ export function MatchupCell({
 }: MatchupCellProps) {
   const delta = (multiplier - 1) * 100
   const who = opponent ?? 'This opponent'
-  const what = statLabel ? statLabel.toLowerCase() : 'this stat'
+  // Name the METRIC, not the projected stat. They differ on two of the six boards -- a kicker's
+  // headline is kicking points while the metric is FG attempts allowed, and a linebacker's is
+  // tackles while the metric is offensive plays run -- so inferring the wording from the
+  // projection label stated something false on those pages.
+  const what = statLabel ? `on ${statLabel.toLowerCase()}` : 'on this position\'s volume metric'
   const phrase =
     Math.abs(delta) < 0.5
-      ? `${what} at about the league-average rate`
-      : `${Math.abs(delta).toFixed(1)}% ${delta > 0 ? 'more' : 'less'} ${what} than a league-average defence`
+      ? `grades as a league-average matchup ${what}`
+      : `grades as a ${Math.abs(delta).toFixed(1)}% ${delta > 0 ? 'softer' : 'tougher'} matchup ${what} than a league-average defence`
   const title =
-    `${who} allows ${phrase} ` +
+    `${who} ${phrase} ` +
     `(multiplier ${multiplier.toFixed(3)}; the projection is already scaled by it).` +
     (rank === null
       ? ' No defensive rank yet for this opponent.'

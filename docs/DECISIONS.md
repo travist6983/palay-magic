@@ -177,3 +177,41 @@ Coverage among 2026-rostered players at the six prop positions, before → after
 | TE | 78.0% | 88.3% |
 | K | 82.5% | 95.0% |
 | LB | 78.8% | 86.0% |
+
+## D13. Timestamps cross the API as naive UTC, and the client must stamp them
+
+The API serialises `datetime` values from the backend's `utcnow()` with no zone marker —
+`"2026-09-05 16:30:40.543348"`. JavaScript reads a zone-less string as **local** time, so every
+age in the header shifted by the viewer's UTC offset: a four-hour-old refresh rendered as
+"23m ago" in Detroit, beside the backend's own "age: 4.1h" in the same tooltip.
+
+East of UTC it is worse than an error of degree. The offset makes the computed age negative,
+`relativeTime` returns "just now", and the §8 freshness badges become structurally incapable of
+ever reporting staleness — the one thing they exist to do.
+
+`frontend/src/lib/format.ts::utcIso` normalises at the single point every consumer goes through,
+and is a no-op on a value that already carries a zone. `format.test.ts` pins it.
+
+## D14. A board's matchup multiplier is not always the projected stat
+
+`queries.board` picks the opponent multiplier from `get_spec(position, headline_stats[0])`, and on
+two of the six boards that metric is not the stat in the headline column:
+
+| Board | Headline stat | Matchup metric |
+|---|---|---|
+| K | Kicking points | **FG attempts allowed / game** |
+| LB | Tackles + assists | **Offensive plays run / game** |
+
+The UI had been naming the metric from the projection label, which made the kicker and linebacker
+tooltips state something false. The API now ships `opponent_metric` and `opponent_metric_label`
+so the UI names what the number actually measures instead of inferring it.
+
+## D15. Non-designations are normalised once, at the ranking layer
+
+Sleeper emits `"NA"` and `"-"` where a healthy player simply has no designation (D11 covers the
+play-probability side). The raw string was still being written to `rankings.injury_status`, so the
+board rendered an injury chip and an empirical-play-rate tooltip on 19 players who are fine —
+several of them rank 1 or 2.
+
+`build_rankings` now normalises through `injury.NON_DESIGNATIONS` before storing. Doing it at the
+source means no consumer has to keep its own copy of the list in step.

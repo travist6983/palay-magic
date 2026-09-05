@@ -33,6 +33,7 @@ from backend.db.connection import connect
 from backend.logging_setup import get_logger
 from backend.models.injury import (
     EXCLUDED_STATUSES,
+    NON_DESIGNATIONS,
 )
 from backend.models.injury import (
     lookup as injury_lookup,
@@ -525,6 +526,13 @@ def build_rankings(season: int, week: int, window: int | None = None) -> int:
 
             inj = injuries.get(gsis, {})
             status = inj.get("injury_status")
+            # Sleeper emits "NA" and "-" where a healthy player simply has no designation. The
+            # play-probability lookup already treats those as healthy, but the raw string was still
+            # being stored on the ranking row, so the UI rendered an injury chip and an
+            # empirical-play-rate tooltip on rank-1 players who are fine. Normalise once, here,
+            # rather than asking every consumer to keep its own copy of the list.
+            if status and status.strip() in NON_DESIGNATIONS:
+                status = None
             roster_status = inj.get("roster_status")
             if status in EXCLUDED_STATUSES or roster_status in {"Injured Reserve", "PUP", "Inactive"}:
                 continue

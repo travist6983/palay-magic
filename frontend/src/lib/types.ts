@@ -72,6 +72,10 @@ export interface BoardRow {
   pass_rate_shift: number
   opponent_multiplier: number
   opponent_rank: number | null
+  /** What the multiplier measures. Not always the projected stat: a kicker's headline is kicking
+   *  points but the matchup metric is FG attempts allowed. */
+  opponent_metric: string | null
+  opponent_metric_label: string | null
   headline: Projection[]
 }
 

@@ -50,6 +50,25 @@ const TONE: Record<Severity, string> = {
   minor: 'bg-ink-line text-chalk-dim',
 }
 
+/**
+ * Sleeper emits these where a healthy player carries no designation at all; the backend treats them
+ * as "no designation" for exactly that reason (backend/models/injury.py::NON_DESIGNATIONS, "treating
+ * NA as one would push 95 healthy players off the board"). They reach the board unchanged --
+ * `rankings.injury_status` holds 'NA' on 19 rows, several of them rank 1 or 2 -- so reading one as a
+ * designation invents an injury on a fully healthy player.
+ */
+const NON_DESIGNATIONS = new Set([
+  '',
+  '-',
+  'na',
+  'n/a',
+  'healthy',
+  'active',
+  'none',
+  'null',
+  'no injury',
+])
+
 const PROBABILITY_NOTE =
   'Play probability is empirical, not a designation lookup: the rate at which players with this ' +
   'designation and final practice status actually suited up in 2023-2025, conditioned on the ' +
@@ -59,15 +78,16 @@ const PROBABILITY_NOTE =
 
 export function InjuryChip({ status, playProbability, className }: InjuryChipProps) {
   const raw = (status ?? '').trim()
-  const healthyWord = ['', 'healthy', 'active', 'none', 'null', 'no injury'].includes(raw.toLowerCase())
+  const undesignated = NON_DESIGNATIONS.has(raw.toLowerCase())
   const certain = !Number.isFinite(playProbability) || playProbability >= 0.995
 
-  // Healthy and certain to play: draw nothing at all.
-  if (healthyWord && certain) return null
+  // No designation and certain to play: draw nothing at all.
+  if (undesignated && certain) return null
 
-  const severity: Severity = healthyWord ? 'minor' : severityOf(raw)
-  const label = healthyWord ? 'RISK' : abbreviate(raw)
-  const title = `${raw || 'No designation posted'} - plays ${pct(playProbability, 0)} of the time. ${PROBABILITY_NOTE}`
+  const severity: Severity = undesignated ? 'minor' : severityOf(raw)
+  const label = undesignated ? 'RISK' : abbreviate(raw)
+  const designation = undesignated ? 'No designation posted' : raw
+  const title = `${designation} - plays ${pct(playProbability, 0)} of the time. ${PROBABILITY_NOTE}`
 
   return (
     <span

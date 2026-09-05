@@ -102,23 +102,28 @@ export function PlayerPage({ gsisId }: PlayerPageProps = {}) {
   }
 
   if (!detail) {
-    if (query.isLoading || query.isFetching) return <PlayerSkeleton />
-    return (
-      <Notice
-        tone="bad"
-        title="Could not load this player"
-        body={describeError(query.error)}
-        action={
-          <button
-            type="button"
-            className="rounded border border-ink-line px-2 py-1 text-xs text-chalk-dim hover:text-chalk"
-            onClick={() => void query.refetch()}
-          >
-            retry
-          </button>
-        }
-      />
-    )
+    // Only a settled failure is an error. A query can also sit pending with no fetch in flight —
+    // React Query pauses a retry while the tab is hidden or the browser is offline — and that is a
+    // wait, not a failure: reporting it as one invents a cause the API never gave.
+    if (query.isError) {
+      return (
+        <Notice
+          tone="bad"
+          title="Could not load this player"
+          body={describeError(query.error)}
+          action={
+            <button
+              type="button"
+              className="rounded border border-ink-line px-2 py-1 text-xs text-chalk-dim hover:text-chalk"
+              onClick={() => void query.refetch()}
+            >
+              retry
+            </button>
+          }
+        />
+      )
+    }
+    return <PlayerSkeleton paused={query.fetchStatus === 'paused'} />
   }
 
   const selectedDist = selectedProjection ? activeDistribution(selectedProjection, mode) : null
@@ -362,7 +367,10 @@ function PlayerHeader({ detail, className }: { detail: PlayerDetail; className?:
 }
 
 function Headshot({ url, name }: { url: string | null; name: string }) {
-  const [broken, setBroken] = useState(false)
+  // Remember WHICH url failed, not just that one did. Navigating to a player whose detail is
+  // already cached re-renders this component in place, so a plain boolean would carry the previous
+  // player's broken image over and hide a perfectly good headshot.
+  const [brokenUrl, setBrokenUrl] = useState<string | null>(null)
   const initials = name
     .split(/\s+/)
     .slice(0, 2)
@@ -370,7 +378,7 @@ function Headshot({ url, name }: { url: string | null; name: string }) {
     .join('')
     .toUpperCase()
 
-  if (!url || broken) {
+  if (!url || brokenUrl === url) {
     return (
       <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded border border-ink-line bg-ink text-sm font-semibold text-chalk-faint">
         {initials || '—'}
@@ -384,7 +392,7 @@ function Headshot({ url, name }: { url: string | null; name: string }) {
       width={64}
       height={64}
       loading="lazy"
-      onError={() => setBroken(true)}
+      onError={() => setBrokenUrl(url)}
       className="h-16 w-16 shrink-0 rounded border border-ink-line bg-ink object-cover"
     />
   )
@@ -403,7 +411,7 @@ function describeError(error: unknown): string {
     return error.status === 404 ? 'no projectable player at this id (404)' : `${error.message} (${error.status})`
   }
   if (error instanceof Error) return error.message
-  return 'the API did not respond'
+  return 'the request failed for an unknown reason'
 }
 
 function Notice({
@@ -436,19 +444,30 @@ function Notice({
   )
 }
 
-function PlayerSkeleton() {
+function PlayerSkeleton({ paused = false }: { paused?: boolean }) {
   return (
-    <div className="flex animate-pulse flex-col gap-3">
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
-        <div className="card h-32 xl:col-span-2" />
-        <div className="card h-32" />
+    <div className="flex flex-col gap-3">
+      {paused ? (
+        <p className="text-[11px] text-warn" role="status">
+          Waiting on the network — the request is paused while this tab is in the background or
+          offline, and resumes on its own.
+        </p>
+      ) : (
+        <span className="sr-only" role="status">
+          Loading player
+        </span>
+      )}
+      <div className={`flex flex-col gap-3 ${paused ? '' : 'animate-pulse'}`}>
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+          <div className="card h-32 xl:col-span-2" />
+          <div className="card h-32" />
+        </div>
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+          <div className="card h-80 xl:col-span-2" />
+          <div className="card h-80" />
+        </div>
+        <div className="card h-48" />
       </div>
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
-        <div className="card h-80 xl:col-span-2" />
-        <div className="card h-80" />
-      </div>
-      <div className="card h-48" />
-      <span className="sr-only">Loading player</span>
     </div>
   )
 }
