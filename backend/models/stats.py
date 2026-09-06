@@ -211,7 +211,7 @@ STAT_SPECS: tuple[StatSpec, ...] = (
              "def_sacks", "pressure_allowed", integer_valued=False, high_variance=True,
              settlement_note="Half-sacks count 0.5 and settle Yes on an anytime-sack (0.5) line."),
     StatSpec("passes_defended", "Passes defended", _LB, Family.POISSON, Aggregation.VOLUME,
-             "def_pass_defended", "pass_volume_allowed", high_variance=True,
+             "def_pass_defended", "opp_dropbacks", high_variance=True,
              settlement_note="More volume-stable than INTs, but still a longshot market."),
 )
 

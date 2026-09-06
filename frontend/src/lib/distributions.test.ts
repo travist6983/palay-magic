@@ -50,6 +50,24 @@ describe('agreement with the Python model', () => {
     })
   })
 
+  it('half-sack Poisson: a push at exactly 0.5 is a real outcome (D9)', () => {
+    // 17.5% of sack credits are exactly 0.5; an integer Poisson had zero mass there.
+    const f = cases.half_sack
+    ;[0.0, 0.5, 1.0].forEach((k, i) => {
+      expect(probExact(f.dist, k)).toBeCloseTo(f.exact[i], 6)
+    })
+    expect(probExact(f.dist, 0.25)).toBe(0)
+    expect(probOver(f.dist, 0.5) + probExact(f.dist, 0.5) + probUnder(f.dist, 0.5)).toBeCloseTo(1, 9)
+  })
+
+  it('kicking points: P(exactly 9) is the 7% point mass, not zero', () => {
+    const f = cases.deterministic
+    ;[9, 10].forEach((k, i) => {
+      expect(probExact(f.dist, k)).toBeCloseTo(f.exact[i], 6)
+    })
+    expect(f.dist.integer_valued).toBe(true)
+  })
+
   it('reproduces the documented passing-TD base rate', () => {
     // how_books_build_lines.md: passing TDs average ~1.5/start; Over 1.5 is the minority side.
     const dist: DistributionParams = {

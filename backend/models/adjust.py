@@ -108,6 +108,7 @@ METRICS: tuple[Metric, ...] = (
     Metric("opp_pass_rate", OFFENSE, "LB", "Pass rate", higher_is_softer=False),
     Metric("pressure_allowed", OFFENSE, "LB", "Sacks allowed / dropback"),
     Metric("opp_rush_volume", OFFENSE, "LB", "Rush attempts run / game"),
+    Metric("opp_dropbacks", OFFENSE, "LB", "Dropbacks / game"),
 )
 
 METRIC_BY_KEY: dict[str, Metric] = {m.key: m for m in METRICS}
@@ -144,12 +145,12 @@ _BOX_METRICS: tuple[tuple[str, str, str], ...] = (
     ("rec_yards_allowed_wr",
      "sum(CASE WHEN position='WR' THEN receiving_yards END)",
      "sum(CASE WHEN position='WR' THEN targets END)"),
-    ("target_volume_allowed_te", "sum(CASE WHEN position='TE' THEN targets END)", "1"),
-    ("rec_volume_allowed_te", "sum(CASE WHEN position='TE' THEN receptions END)", "1"),
+    ("target_volume_allowed_te", "coalesce(sum(CASE WHEN position='TE' THEN targets END), 0)", "1"),
+    ("rec_volume_allowed_te", "coalesce(sum(CASE WHEN position='TE' THEN receptions END), 0)", "1"),
     ("rec_yards_allowed_te",
      "sum(CASE WHEN position='TE' THEN receiving_yards END)",
      "sum(CASE WHEN position='TE' THEN targets END)"),
-    ("fg_attempts_allowed", "sum(CASE WHEN position='K' THEN fg_att END)", "1"),
+    ("fg_attempts_allowed", "coalesce(sum(CASE WHEN position='K' THEN fg_att END), 0)", "1"),
 )
 
 # Play-level metrics the box score cannot express, from raw_pbp.
@@ -160,9 +161,14 @@ _PBP_DEFENSE_METRICS: tuple[tuple[str, str, str], ...] = (
     ("explosive_pass_allowed",
      "sum(CASE WHEN complete_pass = 1 AND yards_gained >= 20 THEN 1 ELSE 0 END)",
      "sum(complete_pass)"),
+    # Kneels can never be explosive and scrambles are a passing-down outcome; both carry
+    # rush_attempt = 1 in nflverse and their share varies by game script (kneels 0.75%-7.1% of
+    # carries faced across defences), so they are excluded from both sides.
     ("explosive_rush_allowed",
-     "sum(CASE WHEN rush_attempt = 1 AND yards_gained >= 10 THEN 1 ELSE 0 END)",
-     "sum(rush_attempt)"),
+     "sum(CASE WHEN rush_attempt = 1 AND qb_dropback = 0 AND coalesce(play_type, '') <> 'qb_kneel' "
+     "         AND yards_gained >= 10 THEN 1 ELSE 0 END)",
+     "sum(CASE WHEN rush_attempt = 1 AND qb_dropback = 0 AND coalesce(play_type, '') <> 'qb_kneel' "
+     "         THEN 1 ELSE 0 END)"),
     ("sack_rate_generated", "sum(sack)", "sum(qb_dropback)"),
     ("epa_per_pass_allowed", "sum(CASE WHEN qb_dropback = 1 THEN epa END)", "sum(qb_dropback)"),
     ("epa_per_rush_allowed", "sum(CASE WHEN rush_attempt = 1 THEN epa END)", "sum(rush_attempt)"),
@@ -175,6 +181,7 @@ _PBP_OFFENSE_METRICS: tuple[tuple[str, str, str], ...] = (
     ("opp_plays_allowed",
      "sum(CASE WHEN qb_dropback = 1 OR rush_attempt = 1 THEN 1 ELSE 0 END)", "1"),
     ("opp_rush_volume", "sum(rush_attempt)", "1"),
+    ("opp_dropbacks", "sum(qb_dropback)", "1"),
     ("opp_pass_rate", "sum(qb_dropback)",
      "sum(CASE WHEN qb_dropback = 1 OR rush_attempt = 1 THEN 1 ELSE 0 END)"),
     ("pressure_allowed", "sum(sack)", "sum(qb_dropback)"),
@@ -251,7 +258,14 @@ def _rz_facts_sql(seasons: str) -> str:
         SELECT
             season, week, game_id, defteam AS team, any_value(posteam) AS opponent,
             fixed_drive,
-            max(CASE WHEN yardline_100 <= 20 THEN 1 ELSE 0 END) AS reached_rz,
+            -- A trip is a SCRIMMAGE snap or a field-goal try inside the 20. The extra-point row is
+            -- snapped from the 15 and sits on the same fixed_drive, so counting every row marked
+            -- a 43-yard touchdown as a red-zone conversion: 2168 drives flagged vs 1794 real in 2025.
+            max(CASE WHEN yardline_100 <= 20
+                      AND (pass_attempt = 1 OR rush_attempt = 1 OR field_goal_attempt = 1)
+                      AND coalesce(extra_point_attempt, 0) = 0
+                      AND coalesce(two_point_attempt, 0) = 0
+                     THEN 1 ELSE 0 END) AS reached_rz,
             max(CASE WHEN fixed_drive_result = 'Touchdown' THEN 1 ELSE 0 END) AS scored_td
         FROM raw_pbp
         WHERE season IN ({seasons}) AND season_type = 'REG'
@@ -643,7 +657,7 @@ def _walk_forward_scores(
 
         y = (test["numerator"] / test["denominator"]).to_numpy()
         w = test["denominator"].to_numpy().astype(float)
-        teams, opps = test["team"].to_list(), test["opponent"].to_list()
+        teams = test["team"].to_list()
 
         preds = {
             "league": np.full(len(y), league_avg),
@@ -655,11 +669,14 @@ def _walk_forward_scores(
         if fit is None:
             preds["ridge"] = preds["league"]
         else:
+            # Score the RATED side alone. The projection only ever applies (mu + rated_effect)/mu;
+            # the faced-side effect is the OTHER team's identity and never reaches a multiplier.
+            # Scoring the full two-sided prediction credited the defence metric with the
+            # offence's predictability: rec_volume_allowed_te read 9.8% MSE reduction of which
+            # 9.3% was the faced side and 0.7% the defence.
             rated = fit.defense if unit == DEFENSE else fit.offense
-            faced = fit.offense if unit == DEFENSE else fit.defense
             preds["ridge"] = np.array(
-                [fit.intercept + rated.get(t, 0.0) + faced.get(o, 0.0)
-                 for t, o in zip(teams, opps, strict=True)]
+                [fit.intercept + rated.get(t, 0.0) for t in teams]
             )
 
         for key, pred in preds.items():
@@ -674,6 +691,19 @@ def _walk_forward_scores(
         for key in ("ridge", "raw")
         if acc[key][1]
     }
+
+
+def load_no_signal_metrics() -> set[tuple[str, str]]:
+    """``(unit, metric)`` pairs whose calibrated out-of-sample MSE reduction is not positive."""
+    with connect() as con:
+        try:
+            rows = con.execute(
+                "SELECT unit, metric FROM metric_reliability "
+                "WHERE mse_reduction_pct IS NOT NULL AND mse_reduction_pct <= 0"
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - table may not exist yet
+            return set()
+    return {(u, m) for u, m in rows}
 
 
 def load_ridge_lambdas() -> dict[tuple[str, str], float]:
@@ -792,6 +822,7 @@ def compute_defense_multipliers(
     # --- the two-way ridge fit, which is what the multiplier actually comes from ---
     lambdas = load_ridge_lambdas()
     betas = load_metric_reliability()
+    no_signal = load_no_signal_metrics()
     fits: dict[tuple[str, str], object] = {}
 
     if model == "two_way_ridge":
@@ -832,6 +863,16 @@ def compute_defense_multipliers(
             continue
 
         fit = fits.get((unit, metric))
+        if (unit, metric) in no_signal:
+            # Walk-forward scoring of the rated side alone says this metric's defence effect does
+            # not beat league average out of sample (MSE reduction <= 0). Applying it would add
+            # noise to every projection that uses it, so it is pinned to neutral. As of the
+            # 2023-25 calibration that is yards-per-target allowed to WRs and RBs, and FG attempts
+            # allowed -- the matchup signals the public treats as most decisive.
+            r["multiplier"] = 1.0
+            r["model"] = "pinned:no_signal"
+            r["effective_k"] = None
+            continue
         if fit is not None:
             r["multiplier"] = (
                 fit.defense_multiplier(r["team"])

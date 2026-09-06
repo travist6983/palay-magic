@@ -194,20 +194,41 @@ def _score_week(run_id: str, season: int, week: int) -> int:
 
 def _refit_for(season: int) -> None:
     """Refit hyperparameters on seasons strictly before ``season``, to avoid leaking the test set."""
-    from backend.models.adjust import calibrate_metrics
-    from backend.models.environment import fit_environment_models
-    from backend.models.project import _DISPERSION_CACHE, _RATE_PRIOR_CACHE
-
     train = [s for s in get_settings().seasons if s < season]
     if not train:
         log.warning("no seasons before %s to train on; keeping the production fit", season)
         return
-
     log.info("refitting hyperparameters on %s (test season %s held out)", train, season)
+    _refit_on(train)
+
+
+def _refit_on(seasons: list[int]) -> None:
+    """Refit every learned artefact on the given seasons.
+
+    Every model that projections consume is refit here, so a replay and the live pipeline go
+    through the same code. Before this function existed the backtest refit two of them on the
+    train seasons and never put the production versions back; 2026 Week 1 was quietly built on
+    2023-24-only ridge penalties and environment coefficients.
+    """
+    from backend.models.adjust import calibrate_metrics
+    from backend.models.environment import fit_environment_models
+    from backend.models.injury import compute_play_rates
+    from backend.models.project import (
+        _DISPERSION_CACHE,
+        _RATE_PRIOR_CACHE,
+        _position_rate_priors,
+        fit_position_dispersion,
+    )
+    from backend.models.touchdowns import fit_td_share_models
+
     _DISPERSION_CACHE.clear()
     _RATE_PRIOR_CACHE.clear()
-    calibrate_metrics(train)
-    fit_environment_models(train)
+    calibrate_metrics(seasons)
+    fit_environment_models(seasons)
+    fit_td_share_models(seasons)
+    compute_play_rates(seasons)
+    fit_position_dispersion(seasons)
+    _position_rate_priors(seasons)
 
 
 # Scales are bounded: a cell asking for 10x is telling us the mean is wrong, not the width.
@@ -437,6 +458,11 @@ def run_backtest(
             ],
         )
 
+    if refit:
+        # Put the production fits back: everything above was fitted with the test season held
+        # out, and the live week must not inherit that.
+        log.info("restoring production fits on %s", get_settings().seasons)
+        _refit_on(list(get_settings().seasons))
     _restore_live_week()
 
     table = calibration_table(run_id, positions)

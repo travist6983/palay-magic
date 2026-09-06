@@ -224,9 +224,36 @@ def _depth_chart(position: Position) -> tuple[dict[str, int], set[str]]:
 STARTER_ONLY: frozenset[Position] = frozenset({Position.QB, Position.K})
 
 
-def _injury_state() -> dict[str, dict]:
-    """gsis_id -> the freshest live injury row across sources (Sleeper preferred over ESPN)."""
+def _injury_state(season: int | None = None, week: int | None = None) -> dict[str, dict]:
+    """gsis_id -> injury designation for the week being built.
+
+    For a HISTORICAL week the source of truth is the official report nflverse carries for exactly
+    that (season, week). The live ``injury_status`` table holds only the current snapshot with no
+    date on it, and applying it to a 2025 replay stamped September-2026 designations onto games
+    from a year earlier -- players who were healthy in 2025 week 10 were excluded or discounted
+    because they happen to be Questionable today. For the live week the snapshot is correct.
+    """
     with connect() as con:
+        if season is not None and week is not None:
+            historical = con.execute(
+                """
+                SELECT gsis_id, report_status, practice_status
+                FROM raw_injuries
+                WHERE season = ? AND week = ? AND gsis_id IS NOT NULL AND report_status IS NOT NULL
+                """,
+                [season, week],
+            ).fetchall()
+            if historical:
+                return {
+                    r[0]: {
+                        "injury_status": r[1],
+                        "practice_participation": r[2],
+                        "roster_status": None,
+                        "source": "nflverse",
+                    }
+                    for r in historical
+                }
+
         rows = con.execute(
             """
             SELECT gsis_id, injury_status, practice_participation, roster_status, source
@@ -463,7 +490,7 @@ def build_rankings(season: int, week: int, window: int | None = None) -> int:
 
     env, league_implied = _context(season, week)
     rosters = _current_teams(season)
-    injuries = _injury_state()
+    injuries = _injury_state(season, week)
     continuity = _continuity(season, week)
 
     with connect() as con:
@@ -541,6 +568,7 @@ def build_rankings(season: int, week: int, window: int | None = None) -> int:
                 report_status=status,
                 practice_status=inj.get("practice_participation"),
                 prior_snap_share=snap_history.get(gsis),
+                position_group=_pg or None,
                 gsis_id=gsis,
             )
 
@@ -582,6 +610,8 @@ def build_rankings(season: int, week: int, window: int | None = None) -> int:
                         "play_probability": play.p_played,
                         "play_probability_source": play.source,
                         "role": play.role,
+                        "snap_ratio": play.snap_ratio,
+                        "injury_source": inj.get("source"),
                         "prior_snap_share": snap_history.get(gsis),
                         "prior_coach": cont.get("prior_coach"),
                         "coach": cont.get("coach"),

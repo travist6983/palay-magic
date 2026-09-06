@@ -148,7 +148,7 @@ function LogCell({ cell, opponent, label, highlighted }: LogCellProps) {
       className={`td text-right ${highlighted ? 'bg-accent/10' : tint}`}
       title={`${label} vs ${opponent ?? 'unknown'} — defence ranked ${
         rank === null ? 'n/a' : `${rank}/${RANKS}`
-      } (1 = softest), ${multiplierLabel(cell.opponent_multiplier)} vs league average. Raw ${formatRaw(
+      } (1 = allows the most), ${multiplierLabel(cell.opponent_multiplier)} vs league average. Raw ${formatRaw(
         cell.raw_value,
       )} adjusts to ${fmtStat(cell.adjusted_value)}.`}
     >

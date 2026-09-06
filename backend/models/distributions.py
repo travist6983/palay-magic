@@ -91,7 +91,11 @@ class Distribution:
         return 1.0 - self.prob_over(line) - self.prob_exact(line)
 
     def prob_exact(self, line: float) -> float:
-        """``P(X == line)``. Non-zero only for an integer-valued stat at a whole number."""
+        """``P(X == line)``. Non-zero only at a value on the support (a whole number, or a whole
+        number of half-sacks for a Poisson with ``unit=0.5``)."""
+        unit = float(self.params.get("unit", 1.0) or 1.0) if self.family is Family.POISSON else 1.0
+        if unit != 1.0:
+            return _pmf(self, line)  # _pmf checks divisibility by the unit itself
         if not self.integer_valued or line != int(line):
             return 0.0
         return _pmf(self, int(line))
@@ -149,6 +153,8 @@ def fit_negative_binomial(mean: float, variance: float, min_dispersion: float = 
 
     r = 1.0 / alpha
     p = r / (r + mean)
+    # Report the variance the (r, p) actually encode: the alpha clamp can move it off the input.
+    variance = mean + alpha * mean * mean
 
     return Distribution(
         family=Family.NEGATIVE_BINOMIAL,
@@ -159,14 +165,23 @@ def fit_negative_binomial(mean: float, variance: float, min_dispersion: float = 
     )
 
 
-def fit_poisson(lam: float) -> Distribution:
-    """Fit a Poisson with rate ``lam`` (§5.6). Variance equals the mean by construction."""
+def fit_poisson(lam: float, unit: float = 1.0) -> Distribution:
+    """Fit a Poisson with rate ``lam`` (§5.6). Variance equals the mean by construction.
+
+    Args:
+        lam: the expected value, in the stat's natural units.
+        unit: the size of one count. Sacks are credited in halves -- 17.5% of all sack credits
+            in 2023-25 are exactly 0.5 (D9) -- so a sack projection is a Poisson on HALF-sacks with
+            ``unit=0.5``: the count is Poisson(lam / unit) and the value is count x unit. With
+            ``unit=1`` this is an ordinary integer Poisson.
+    """
     lam = max(float(lam), _MIN_MEAN)
+    unit = float(unit) if unit and unit > 0 else 1.0
     return Distribution(
         family=Family.POISSON,
-        params={"lam": lam, "mean": lam, "variance": lam},
+        params={"lam": lam, "mean": lam, "variance": lam * unit, "unit": unit},
         mean=lam,
-        integer_valued=True,
+        integer_valued=unit == 1.0,
     )
 
 
@@ -266,7 +281,9 @@ def fit_longest(
     maxima = np.zeros(n_sims, dtype=float)
     total = int(counts.sum())
 
-    gains = np.asarray(play_gains, dtype=float) if play_gains is not None else None
+    # Sorted so the same multiset of gains gives the same draws under the same seed, whatever
+    # order the database returned the rows in ("Show math" promises reproducibility, §1.4).
+    gains = np.sort(np.asarray(play_gains, dtype=float)) if play_gains is not None else None
     bootstrapped = gains is not None and gains.size >= 8
 
     if total > 0:
@@ -354,6 +371,8 @@ def fit_deterministic(terms: list[tuple[str, float, Distribution]]) -> Distribut
         support, probs = uniq, collapsed
 
     mean = float((support * probs).sum())
+    # Integer-valued iff every coefficient is an integer: 3 x FGM + 1 x XPM always is.
+    integer_valued = all(float(c).is_integer() for _, c, _ in terms)
     return Distribution(
         family=Family.DETERMINISTIC,
         params={
@@ -363,7 +382,7 @@ def fit_deterministic(terms: list[tuple[str, float, Distribution]]) -> Distribut
             "mean": mean,
         },
         mean=mean,
-        integer_valued=False,
+        integer_valued=integer_valued,
     )
 
 
@@ -378,7 +397,8 @@ def _quantile(dist: Distribution, q: float) -> float:
         case Family.NEGATIVE_BINOMIAL:
             return float(stats.nbinom.ppf(q, p["r"], p["p"]))
         case Family.POISSON:
-            return float(stats.poisson.ppf(q, p["lam"]))
+            u = float(p.get("unit", 1.0) or 1.0)
+            return float(stats.poisson.ppf(q, p["lam"] / u)) * u
         case Family.BERNOULLI:
             return 1.0 if q > (1.0 - p["p"]) else 0.0
         case Family.EMPIRICAL_MAX:
@@ -397,7 +417,9 @@ def _prob_over(dist: Distribution, line: float) -> float:
         case Family.NEGATIVE_BINOMIAL:
             return float(stats.nbinom.sf(math.floor(line), p["r"], p["p"]))
         case Family.POISSON:
-            return float(stats.poisson.sf(math.floor(line), p["lam"]))
+            u = float(p.get("unit", 1.0) or 1.0)
+            # P(count x unit > line) = P(count > line / unit); floor handles a line between counts.
+            return float(stats.poisson.sf(math.floor(line / u + 1e-9), p["lam"] / u))
         case Family.BERNOULLI:
             return p["p"] if line < 1 else 0.0
         case Family.EMPIRICAL_MAX:
@@ -413,17 +435,33 @@ def _prob_over(dist: Distribution, line: float) -> float:
     raise ValueError(f"unknown family {dist.family}")
 
 
-def _pmf(dist: Distribution, k: int) -> float:
+def _pmf(dist: Distribution, k: float) -> float:
     p = dist.params
     match dist.family:
         case Family.NEGATIVE_BINOMIAL:
             return float(stats.nbinom.pmf(k, p["r"], p["p"]))
         case Family.POISSON:
-            return float(stats.poisson.pmf(k, p["lam"]))
+            u = float(p.get("unit", 1.0) or 1.0)
+            count = k / u
+            if not float(count).is_integer():
+                return 0.0
+            return float(stats.poisson.pmf(int(round(count)), p["lam"] / u))
         case Family.BERNOULLI:
             return p["p"] if k == 1 else (1.0 - p["p"] if k == 0 else 0.0)
-        case Family.EMPIRICAL_MAX | Family.DETERMINISTIC:
-            return 0.0
+        case Family.DETERMINISTIC:
+            # Kicking points have an enumerated support with known point masses; a push at an
+            # integer line is a real outcome (3 x FGM + XPM = 9 happens 7% of the time at
+            # lambda 1.6 / 2.3) and P(under) was wrong by exactly that mass.
+            support = np.asarray(p["support"])
+            probs = np.asarray(p["probs"])
+            hit = np.isclose(support, float(k))
+            return float(probs[hit].sum()) if hit.any() else 0.0
+        case Family.EMPIRICAL_MAX:
+            samples = p.get("samples_sorted")
+            if not samples:
+                return 0.0
+            arr = np.asarray(samples)
+            return float(np.isclose(arr, float(k)).mean())
     raise ValueError(f"unknown family {dist.family}")
 
 

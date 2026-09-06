@@ -15,6 +15,7 @@ actually is.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -68,6 +69,88 @@ def _fit(name: str, X: np.ndarray, y: np.ndarray, feature_names: list[str]) -> L
     )
 
 
+def _pace_by_team_game(season_filter: str, params: list[Any] | None = None) -> pl.DataFrame:
+    """Median snap-to-snap seconds per (season, week, team). ONE definition for fit and serve.
+
+    The plays model was fitted on a rolling mean of per-game medians but served an all-time mean
+    over every play, a different statistic by ~5 seconds -- which biased expected plays by +2.3 a
+    game for every team. Both paths now call this.
+    """
+    sql = f"""
+    SELECT season, week, posteam AS team,
+           median(CASE WHEN play_clock_seconds BETWEEN 1 AND 60 THEN play_clock_seconds END) AS med_clock
+    FROM (
+        SELECT season, week, posteam,
+               lag(game_seconds_remaining) OVER (
+                   PARTITION BY game_id, posteam, fixed_drive ORDER BY play_id
+               ) - game_seconds_remaining AS play_clock_seconds
+        FROM raw_pbp
+        WHERE {season_filter} AND season_type = 'REG' AND posteam IS NOT NULL
+          AND (qb_dropback = 1 OR rush_attempt = 1)
+    )
+    GROUP BY 1, 2, 3
+    """
+    with connect() as con:
+        return con.execute(sql, params or []).pl()
+
+
+def measure_constants(seasons: list[int]) -> dict[str, float]:
+    """The scalar ratios the usage model needs, measured rather than assumed.
+
+    * ``attempts_per_dropback`` -- official attempts / dropbacks (0.88; was hard-coded 0.885).
+    * ``targets_per_attempt`` -- official targets / attempts (0.953). target_share is defined
+      against team TARGETS, so multiplying it by expected ATTEMPTS overstated every target
+      projection by ~4.9%.
+    * ``scrambles_per_dropback`` -- carry_share is measured against official carries, which
+      include scrambles; plays minus dropbacks does not, so RB carries came out ~7% low.
+    * ``xp_made_per_td`` -- extra points MADE per offensive touchdown (0.905). The old 0.94 was
+      attempts, which omitted the make rate.
+    * ``rz_trips_per_drive`` -- measured 0.31, not the assumed 0.38.
+    """
+    season_list = ",".join(str(x) for x in seasons)
+    with connect() as con:
+        row = con.execute(
+            f"""
+            SELECT
+              sum(CASE WHEN pass_attempt = 1 AND sack = 0 AND coalesce(two_point_attempt,0) = 0 THEN 1 ELSE 0 END)::DOUBLE
+                / nullif(sum(qb_dropback), 0)                                            AS attempts_per_dropback,
+              sum(CASE WHEN qb_dropback = 1 AND rush_attempt = 1 THEN 1 ELSE 0 END)::DOUBLE
+                / nullif(sum(qb_dropback), 0)                                            AS scrambles_per_dropback,
+              sum(CASE WHEN extra_point_result = 'good' THEN 1 ELSE 0 END)::DOUBLE
+                / nullif(sum(CASE WHEN touchdown = 1 AND td_team = posteam
+                                   AND coalesce(play_type,'') <> 'kickoff' THEN 1 ELSE 0 END), 0) AS xp_made_per_td
+            FROM raw_pbp WHERE season IN ({season_list}) AND season_type = 'REG' AND posteam IS NOT NULL
+            """
+        ).fetchone()
+        tgt = con.execute(
+            f"""
+            SELECT sum(targets)::DOUBLE / nullif(sum(attempts), 0)
+            FROM raw_player_stats WHERE season IN ({season_list}) AND season_type = 'REG'
+            """
+        ).fetchone()
+        rz = con.execute(
+            f"""
+            WITH d AS (
+                SELECT game_id, fixed_drive,
+                       max(CASE WHEN yardline_100 <= 20 AND (pass_attempt = 1 OR rush_attempt = 1
+                                 OR field_goal_attempt = 1) AND coalesce(extra_point_attempt,0) = 0
+                                THEN 1 ELSE 0 END) AS rz
+                FROM raw_pbp
+                WHERE season IN ({season_list}) AND season_type = 'REG' AND posteam IS NOT NULL
+                  AND (qb_dropback = 1 OR rush_attempt = 1 OR field_goal_attempt = 1)
+                GROUP BY 1, 2
+            ) SELECT avg(rz) FROM d
+            """
+        ).fetchone()
+    return {
+        "attempts_per_dropback": float(row[0] or 0.881),
+        "scrambles_per_dropback": float(row[1] or 0.055),
+        "xp_made_per_td": float(row[2] or 0.905),
+        "targets_per_attempt": float(tgt[0] or 0.953),
+        "rz_trips_per_drive": float(rz[0] or 0.31),
+    }
+
+
 def _training_frame(seasons: list[int]) -> pl.DataFrame:
     """One row per team-game with the market line, what the team actually did, and its recent form."""
     season_list = ",".join(str(s) for s in seasons)
@@ -89,25 +172,14 @@ def _training_frame(seasons: list[int]) -> pl.DataFrame:
     ),
     scoring AS (
         SELECT season, week, game_id, posteam AS team,
-               sum(CASE WHEN touchdown = 1 AND td_team = posteam THEN 1 ELSE 0 END) AS tds,
+               -- Kickoff rows carry the RECEIVING team as posteam, so a kick-return TD would
+               -- be credited to the offence's touchdown count that feeds every TD lambda.
+               sum(CASE WHEN touchdown = 1 AND td_team = posteam
+                         AND coalesce(play_type, '') <> 'kickoff' THEN 1 ELSE 0 END) AS tds,
                sum(CASE WHEN field_goal_result = 'made' THEN 1 ELSE 0 END)          AS fgs,
                sum(CASE WHEN field_goal_attempt = 1 THEN 1 ELSE 0 END)              AS fg_atts
         FROM raw_pbp
         WHERE season IN ({season_list}) AND season_type = 'REG' AND posteam IS NOT NULL
-        GROUP BY 1, 2, 3, 4
-    ),
-    pace AS (
-        SELECT season, week, game_id, posteam AS team,
-               median(CASE WHEN play_clock_seconds BETWEEN 1 AND 60 THEN play_clock_seconds END) AS med_clock
-        FROM (
-            SELECT season, week, game_id, posteam,
-                   lag(game_seconds_remaining) OVER (
-                       PARTITION BY game_id, fixed_drive ORDER BY play_id
-                   ) - game_seconds_remaining AS play_clock_seconds
-            FROM raw_pbp
-            WHERE season IN ({season_list}) AND season_type = 'REG' AND posteam IS NOT NULL
-              AND (qb_dropback = 1 OR rush_attempt = 1)
-        )
         GROUP BY 1, 2, 3, 4
     ),
     lines AS (
@@ -121,7 +193,6 @@ def _training_frame(seasons: list[int]) -> pl.DataFrame:
         tg.plays, tg.dropbacks, tg.rush_attempts, tg.pass_attempts, tg.mean_xpass,
         tg.drives, tg.rz_plays,
         s.tds, s.fgs, s.fg_atts,
-        pc.med_clock,
         l.total_line,
         -- The team's OWN spread: negative when it is favoured.
         CASE WHEN tg.team = l.home_team THEN -l.spread_line ELSE l.spread_line END AS spread,
@@ -129,12 +200,13 @@ def _training_frame(seasons: list[int]) -> pl.DataFrame:
         (tg.team = l.home_team) AS is_home
     FROM team_game tg
     LEFT JOIN scoring s ON s.season=tg.season AND s.week=tg.week AND s.game_id=tg.game_id AND s.team=tg.team
-    LEFT JOIN pace    pc ON pc.season=tg.season AND pc.week=tg.week AND pc.game_id=tg.game_id AND pc.team=tg.team
     JOIN lines        l  ON l.game_id = tg.game_id
     WHERE l.total_line IS NOT NULL AND l.spread_line IS NOT NULL
     """
     with connect() as con:
-        return con.execute(sql).pl()
+        frame = con.execute(sql).pl()
+    pace = _pace_by_team_game(f"season IN ({season_list})")
+    return frame.join(pace, on=["season", "week", "team"], how="left")
 
 
 def fit_environment_models(seasons: list[int] | None = None) -> dict[str, LinearModel]:
@@ -170,6 +242,7 @@ def fit_environment_models(seasons: list[int] | None = None) -> dict[str, Linear
         pl.col("pass_rate").shift(1).rolling_mean(6, min_periods=2).over("team").alias("prior_pass_rate"),
         pl.col("mean_xpass").shift(1).rolling_mean(6, min_periods=2).over("team").alias("prior_xpass"),
         pl.col("med_clock").shift(1).rolling_mean(6, min_periods=2).over("team").alias("prior_sec_per_play"),
+        pl.col("rush_attempts").shift(1).rolling_mean(6, min_periods=2).over("team").alias("prior_rush_attempts"),
     )
 
     models: dict[str, LinearModel] = {}
@@ -212,6 +285,15 @@ def fit_environment_models(seasons: list[int] | None = None) -> dict[str, Linear
         ["implied_total"],
     )
 
+    # Team rush attempts INCLUDING scrambles, on the same footing carry_share is measured on.
+    rush_df = df.drop_nulls(["prior_rush_attempts"])
+    models["rush_attempts"] = _fit(
+        "rush_attempts",
+        rush_df.select("prior_rush_attempts", "spread", "total_line").to_numpy(),
+        rush_df["rush_attempts"].to_numpy().astype(float),
+        ["prior_rush_attempts", "spread", "total_line"],
+    )
+
     drive_df = df.drop_nulls(["drives"])
     models["drives"] = _fit(
         "drives",
@@ -228,12 +310,15 @@ def fit_environment_models(seasons: list[int] | None = None) -> dict[str, Linear
         for m in models.values()
         for term, coef in m.terms.items()
     ]
+    for term, value in measure_constants(seasons).items():
+        rows.append({"model": "constants", "term": term, "coefficient": value,
+                     "n_observations": df.height, "r_squared": None, "rmse": None})
     frame = pl.DataFrame(rows)
     with connect() as con:
         con.register("env_df", frame)
         try:
             con.execute("BEGIN TRANSACTION")
-            con.execute("DELETE FROM environment_models")
+            con.execute("DELETE FROM environment_models WHERE model NOT LIKE 'td_%'")
             con.execute(
                 "INSERT INTO environment_models "
                 "(model, term, coefficient, n_observations, r_squared, rmse, computed_at) "
@@ -270,6 +355,31 @@ def load_environment_models() -> dict[str, LinearModel]:
         name: LinearModel(name, e["terms"], int(e["n"] or 0), float(e["r2"] or 0), float(e["rmse"] or 0))
         for name, e in grouped.items()
     }
+
+
+_DEFAULT_CONSTANTS = {
+    "attempts_per_dropback": 0.881,
+    "scrambles_per_dropback": 0.055,
+    "xp_made_per_td": 0.905,
+    "targets_per_attempt": 0.953,
+    "rz_trips_per_drive": 0.31,
+}
+
+
+def load_constants() -> dict[str, float]:
+    """The measured ratios, with the 2023-25 values as a fallback before the first fit."""
+    out = dict(_DEFAULT_CONSTANTS)
+    with connect() as con:
+        try:
+            rows = con.execute(
+                "SELECT term, coefficient FROM environment_models WHERE model = 'constants'"
+            ).fetchall()
+        except Exception:  # noqa: BLE001 - table may not exist yet
+            return out
+    for term, value in rows:
+        if value is not None:
+            out[term] = float(value)
+    return out
 
 
 def build_team_environment(season: int, week: int) -> int:
@@ -325,21 +435,31 @@ def build_team_environment(season: int, week: int) -> int:
             [season, season, week],
         ).pl()
 
-        pace = con.execute(
+        prior_rush = con.execute(
             """
-            SELECT team, avg(sec) AS prior_sec_per_play FROM (
-                SELECT posteam AS team, season, week,
-                       lag(game_seconds_remaining) OVER (
-                           PARTITION BY game_id, fixed_drive ORDER BY play_id
-                       ) - game_seconds_remaining AS sec
+            SELECT posteam AS team, avg(r) AS prior_rush_attempts FROM (
+                SELECT posteam, season, week, sum(rush_attempt) AS r,
+                       row_number() OVER (PARTITION BY posteam ORDER BY season DESC, week DESC) AS ago
                 FROM raw_pbp
                 WHERE season_type = 'REG' AND posteam IS NOT NULL
-                  AND (qb_dropback = 1 OR rush_attempt = 1)
                   AND ((season < ?) OR (season = ? AND week < ?))
-            ) WHERE sec BETWEEN 1 AND 60 GROUP BY 1
+                GROUP BY 1, 2, 3
+            ) WHERE ago <= 6 GROUP BY 1
             """,
             [season, season, week],
         ).pl()
+
+    # Rolling mean of the last six per-game MEDIANS -- the statistic the plays model was fitted on.
+    pace_games = _pace_by_team_game(
+        "((season < ?) OR (season = ? AND week < ?))", [season, season, week]
+    )
+    pace = (
+        pace_games.sort(["team", "season", "week"], descending=[False, True, True])
+        .with_columns(pl.int_range(pl.len()).over("team").alias("ago"))
+        .filter(pl.col("ago") < 6)
+        .group_by("team")
+        .agg(pl.col("med_clock").mean().alias("prior_sec_per_play"))
+    )
 
     if games.is_empty():
         log.warning("no game_environment rows for %s week %s", season, week)
@@ -347,9 +467,12 @@ def build_team_environment(season: int, week: int) -> int:
 
     form_map = {r["team"]: r for r in form.to_dicts()}
     pace_map = {r["team"]: r["prior_sec_per_play"] for r in pace.to_dicts()}
-    league_pace = float(pace["prior_sec_per_play"].mean()) if pace.height else 28.0
+    rush_map = {r["team"]: r["prior_rush_attempts"] for r in prior_rush.to_dicts()}
+    league_pace = float(pace["prior_sec_per_play"].mean()) if pace.height else 35.0
     league_plays = float(form["prior_plays"].mean()) if form.height else 62.0
     league_pass_rate = float(form["prior_pass_rate"].mean()) if form.height else 0.57
+    league_rush = float(prior_rush["prior_rush_attempts"].mean()) if prior_rush.height else 27.0
+    constants = load_constants()
 
     rows: list[dict[str, object]] = []
     for g in games.to_dicts():
@@ -374,6 +497,7 @@ def build_team_environment(season: int, week: int) -> int:
                 "prior_pass_rate": prior_pass_rate,
                 "prior_xpass": prior_xpass,
                 "prior_sec_per_play": sec_per_play,
+                "prior_rush_attempts": rush_map.get(team) or league_rush,
                 "total_line": g["total_line"] or 44.0,
                 "spread": spread or 0.0,
                 "abs_spread": abs(spread or 0.0),
@@ -387,10 +511,15 @@ def build_team_environment(season: int, week: int) -> int:
             fg_atts = max(0.2, models["team_fg_attempts"].predict(features))
 
             dropbacks = plays * pass_rate
-            # A dropback is a pass attempt, a sack or a scramble; league sack+scramble rate is
-            # about 11.5% of dropbacks, so attempts are the rest.
-            pass_attempts = dropbacks * 0.885
-            rush_attempts = plays - dropbacks
+            # Attempts are dropbacks less sacks and scrambles; the ratio is measured, not assumed.
+            pass_attempts = dropbacks * constants["attempts_per_dropback"]
+            # Official team carries include scrambles. plays - dropbacks does not, and carry_share
+            # is measured against the official count, so the rush model is fitted on that count.
+            rush_attempts = (
+                max(8.0, models["rush_attempts"].predict(features))
+                if "rush_attempts" in models
+                else plays - dropbacks + dropbacks * constants["scrambles_per_dropback"]
+            )
 
             rows.append(
                 {
@@ -407,7 +536,7 @@ def build_team_environment(season: int, week: int) -> int:
                     "expected_rush_attempts": rush_attempts,
                     "expected_dropbacks": dropbacks,
                     "expected_drives": drives,
-                    "expected_rz_trips": drives * 0.38,
+                    "expected_rz_trips": drives * constants["rz_trips_per_drive"],
                     "expected_team_tds": team_tds,
                     "expected_team_fgs": fg_atts,
                     "wind": wind,

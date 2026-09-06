@@ -140,8 +140,8 @@ def test_empty_roster_does_not_crash():
     [
         ("Full Participation in Practice", "Full"),
         ("Limited Participation in Practice", "Limited"),
-        ("Did Not Participate In Practice", "Did Not Participate In Practice"),
-        ("DNP", "Did Not Participate In Practice"),
+        ("Did Not Participate In Practice", "DNP"),
+        ("DNP", "DNP"),
         ("full", "Full"),
         (None, "Unknown"),
         ("", "Unknown"),

@@ -225,20 +225,16 @@ def tune_ridge(
         y_true = (test["numerator"] / test["denominator"]).to_numpy()
         w_test = test["denominator"].to_numpy().astype(float)
         rated = test["team"].to_list()
-        faced = test["opponent"].to_list()
 
         for lam in candidates:
             fit = fit_two_way(train, metric, unit, ridge_lambda=lam, halflife_games=halflife_games)
             if fit is None:
                 continue
+            # Only the rated side becomes a multiplier, so only the rated side is scored
+            # (see adjust._walk_forward_scores). Tuning on the full prediction picked penalties
+            # for the offence effect's benefit, not the defence's.
             rated_map = fit.defense if unit == "defense" else fit.offense
-            faced_map = fit.offense if unit == "defense" else fit.defense
-            pred = np.array(
-                [
-                    fit.intercept + rated_map.get(r, 0.0) + faced_map.get(f, 0.0)
-                    for r, f in zip(rated, faced, strict=True)
-                ]
-            )
+            pred = np.array([fit.intercept + rated_map.get(r, 0.0) for r in rated])
             errors[lam][0] += float((w_test * (y_true - pred) ** 2).sum())
             errors[lam][1] += float(w_test.sum())
 

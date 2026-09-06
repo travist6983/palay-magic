@@ -48,16 +48,24 @@ from backend.models.distributions import (
     fit_negative_binomial,
     fit_poisson,
 )
+from backend.models.environment import load_constants
 from backend.models.injury import (
+    EXCLUDED_STATUSES,
     PlayProbability,
     apply_unconditional,
     inflate_variance_for_uncertainty,
+    redistribute_target_share,
     role_bucket,
 )
 from backend.models.injury import (
     lookup as injury_lookup,
 )
 from backend.models.stats import Family, Position, get_spec
+from backend.models.touchdowns import (
+    TDShareModel,
+    load_td_share_models,
+    player_td_history,
+)
 from backend.models.weather import (
     FieldGoalModel,
     WindEffect,
@@ -75,8 +83,10 @@ _DISPERSION_CACHE: dict[tuple[str, str], float] = {}
 _RATE_PRIOR_CACHE: dict[tuple[str, str, str], float] = {}
 _DISPERSION_SCALE_CACHE: dict[tuple[str, str], float] | None = None
 
-# XP conversion rate net of two-point attempts, so kicking points are not inflated.
-XP_PER_TD = 0.94
+# Extra points MADE per offensive touchdown, measured (0.905 over 2023-25). The old constant
+# 0.94 was ATTEMPTS per touchdown and omitted the make rate, so xp_made ran 3.9% high.
+def _xp_per_td(constants: dict[str, float]) -> float:
+    return float(constants.get("xp_made_per_td", 0.905))
 
 
 @dataclass
@@ -236,6 +246,95 @@ class ProjectionContext:
     fg_distances: tuple[np.ndarray, np.ndarray]
     dispersion: dict[tuple[str, str], float]
     league_implied: float
+    constants: dict[str, float] = field(default_factory=dict)
+    td_models: dict[str, TDShareModel] = field(default_factory=dict)
+    absent: dict[str, list[dict]] = field(default_factory=dict)
+    """team -> players who are Out / IR / Doubtful this week with their usage shares (§5.4)."""
+    healthy_shares: dict[tuple[str, str], dict[str, float]] = field(default_factory=dict)
+    """(team, position) -> {gsis_id: trailing target share} for players NOT ruled out, so an absent
+    player's slice is divided among them rather than handed whole to each one."""
+
+
+def _absent_by_team(season: int, week: int) -> dict[str, list[dict]]:
+    """Rostered players ruled out this week, with the target share they leave behind (§5.4).
+
+    The redistribution helper existed since milestone 1 and was never called; an Out WR1 moved
+    nobody's projection. Shares are the trailing six games' snap-weighted target share, and a
+    player only counts if he was on the roster and drawing targets.
+    """
+    from backend.models.ranking import _injury_state
+
+    injuries = _injury_state(season, week)
+    excluded = {g for g, i in injuries.items() if (i.get("injury_status") in EXCLUDED_STATUSES)}
+    if not excluded:
+        return {}
+
+    with connect() as con:
+        rows = con.execute(
+            f"""
+            SELECT gsis_id, team, position,
+                   avg(target_share) AS target_share, avg(carry_share) AS carry_share
+            FROM (
+                SELECT *, row_number() OVER (PARTITION BY gsis_id ORDER BY season DESC, week DESC) AS rn
+                FROM player_game_usage
+                WHERE gsis_id IN ({",".join("?" * len(excluded))})
+                  AND ((season < ?) OR (season = ? AND week < ?))
+            ) WHERE rn <= 6 GROUP BY 1, 2, 3
+            """,
+            [*excluded, season, season, week],
+        ).fetchall()
+        current = {
+            g: t
+            for g, t in con.execute(
+                "SELECT gsis_id, team FROM raw_rosters WHERE season = ? AND gsis_id IS NOT NULL",
+                [season],
+            ).fetchall()
+        }
+
+    out: dict[str, list[dict]] = {}
+    for gsis, team, position, tgt, carry in rows:
+        team = current.get(gsis, team)
+        if not team or not ((tgt or 0) > 0.03 or (carry or 0) > 0.05):
+            continue
+        out.setdefault(team, []).append(
+            {"gsis_id": gsis, "position": position, "target_share": float(tgt or 0.0),
+             "carry_share": float(carry or 0.0)}
+        )
+    return out
+
+
+def _healthy_shares(season: int, week: int, absent: dict[str, list[dict]]) -> dict[tuple[str, str], dict[str, float]]:
+    """Trailing target share of every rostered, not-ruled-out receiver, by (team, position).
+
+    This is the denominator the redistribution divides by. Handing the whole 60% WR2 slice to
+    every ranked wide receiver -- which is what the first version did -- put team targets 8% over
+    attempts on a replay week and turned a +1.0 target bias into +2.6.
+    """
+    if not absent:
+        return {}
+    out_ids = {a["gsis_id"] for lst in absent.values() for a in lst}
+    with connect() as con:
+        rows = con.execute(
+            """
+            SELECT r.gsis_id, r.team, p.position, coalesce(u.target_share, 0.0)
+            FROM raw_rosters r
+            JOIN players p USING (gsis_id)
+            LEFT JOIN (
+                SELECT gsis_id, avg(target_share) AS target_share FROM (
+                    SELECT *, row_number() OVER (PARTITION BY gsis_id ORDER BY season DESC, week DESC) AS rn
+                    FROM player_game_usage WHERE (season < ?) OR (season = ? AND week < ?)
+                ) WHERE rn <= 6 GROUP BY 1
+            ) u USING (gsis_id)
+            WHERE r.season = ? AND r.gsis_id IS NOT NULL AND p.position IN ('WR','TE','RB')
+            """,
+            [season, season, week, season],
+        ).fetchall()
+    out: dict[tuple[str, str], dict[str, float]] = {}
+    for gsis, team, position, share in rows:
+        if gsis in out_ids or not team:
+            continue
+        out.setdefault((team, position), {})[gsis] = float(share or 0.0)
+    return out
 
 
 def build_context(season: int, week: int) -> ProjectionContext:
@@ -248,7 +347,7 @@ def build_context(season: int, week: int) -> ProjectionContext:
     environment = {r["team"]: r for r in env.to_dicts()}
     league_implied = float(env["implied_total"].mean()) if env.height else 22.0
 
-    return ProjectionContext(
+    ctx = ProjectionContext(
         season=season,
         week=week,
         environment=environment,
@@ -259,12 +358,12 @@ def build_context(season: int, week: int) -> ProjectionContext:
         fg_distances=attempt_distance_distribution(),
         dispersion=fit_position_dispersion(),
         league_implied=league_implied,
+        constants=load_constants(),
+        td_models=load_td_share_models(),
+        absent=_absent_by_team(season, week),
     )
-
-
-# ---------------------------------------------------------------------------
-# Player inputs
-# ---------------------------------------------------------------------------
+    ctx.healthy_shares = _healthy_shares(season, week, ctx.absent)
+    return ctx
 
 
 def _player_history(gsis_id: str, season: int, week: int, window: int) -> pl.DataFrame:
@@ -505,6 +604,51 @@ def _rate(
 # ---------------------------------------------------------------------------
 
 
+def _redistributed_target_share(
+    share: float, gsis_id: str, team: str, position: str, ctx: ProjectionContext, steps: list
+) -> float:
+    """Add the share an absent teammate leaves behind (§5.4).
+
+    Historical games without the absent player are not available per pair, so the documented
+    60/25/15 fallback to WR2/TE/RB applies, with this player's slice keyed by position. A WR
+    receives the WR2 slice; a TE the TE slice; an RB the RB slice.
+    """
+    absent = [a for a in ctx.absent.get(team, []) if a["gsis_id"] != gsis_id]
+    if not absent:
+        return share
+    role_key = {"WR": "WR2", "TE": "TE", "RB": "RB"}.get(position)
+    if role_key is None:
+        return share
+    total_absent = sum(a["target_share"] for a in absent)
+    if total_absent <= 0:
+        return share
+    # The position's slice of the absent share (60/25/15), then THIS player's proportional part
+    # of that slice among the healthy players at his position.
+    slice_share = float(redistribute_target_share(total_absent, {role_key: 0.0}).get(role_key, 0.0))
+    peers = ctx.healthy_shares.get((team, position), {})
+    peer_total = sum(peers.values())
+    own = peers.get(gsis_id, share)
+    fraction = (own / peer_total) if peer_total > 0 else (1.0 / max(len(peers), 1))
+    new_share = share + slice_share * fraction
+    steps.append(
+        MathStep(
+            "5.4 usage", "absent teammates' target share", total_absent,
+            ", ".join(a["gsis_id"] for a in absent),
+        )
+    )
+    steps.append(MathStep("5.4 usage", "share of the position's slice", fraction,
+                          f"{len(peers)} healthy {position}s on the roster"))
+    steps.append(MathStep("5.4 usage", "target share after redistribution", new_share, "60/25/15 fallback"))
+    return new_share
+
+
+def _expected_targets(env: dict, ctx: ProjectionContext) -> float:
+    """Team targets, not attempts. target_share is defined against official TARGETS, which are
+    ~95.3% of attempts (throwaways, spikes, batted balls); multiplying it by attempts overstated
+    every target projection by 4.9%."""
+    return float(env["expected_pass_attempts"]) * ctx.constants.get("targets_per_attempt", 0.953)
+
+
 def _share_of_team(
     history: pl.DataFrame, usage: pl.DataFrame, stat: str, team_column: str, default: float
 ) -> float:
@@ -547,7 +691,7 @@ def _share_of_team(
 def _passing_td_share(team: str, ctx: ProjectionContext, player_pass_tds: float) -> float:
     """Share of a team's touchdowns that come as passing scores, shrunk toward the league split.
 
-    League-wide roughly 58% of offensive touchdowns are thrown. A team's own rate over the trailing
+    League-wide 61.4% of offensive touchdowns are thrown (2023-25). A team's own rate over the trailing
     window is noisy on ~2.4 touchdowns a game, so it is shrunk toward that league value.
     """
     with connect() as con:
@@ -570,7 +714,7 @@ def _passing_td_share(team: str, ctx: ProjectionContext, player_pass_tds: float)
             [team, ctx.season, ctx.season, ctx.week],
         ).fetchone()
 
-    league_share = 0.58
+    league_share = 0.614  # measured over 2023-25: passing TDs / (passing + rushing TDs)
     prior_tds = 12.0
     if not row or not row[1]:
         return league_share
@@ -587,6 +731,61 @@ def _scaled_poisson(position: str, stat: str, lam: float, steps: list[MathStep])
     steps.append(MathStep("5.6 dispersion", "calibrated width scale", scale,
                           "fitted on a held-out season"))
     return fit_count(lam, max(lam * scale, lam * 1.0001), overdispersion_threshold=1.05)
+
+
+def _td_lambda(
+    proj: PlayerProjection,
+    usage: pl.DataFrame,
+    env: dict,
+    ctx: ProjectionContext,
+    rushing_only: bool,
+) -> tuple[float, list[MathStep]]:
+    """Expected touchdowns from the FITTED share model (§5.6, backend/models/touchdowns.py).
+
+    Team touchdowns are split into rushing and receiving by the team's own (shrunk) pass share,
+    then each side is multiplied by a fitted share of that side's scores. The hand-set constants
+    this replaces over-predicted QB rushing scores 2x and under-predicted tight ends by 13 points.
+    """
+    model = ctx.td_models.get(proj.position)
+    team_tds = float(env["expected_team_tds"])
+    pass_share = _passing_td_share(proj.team, ctx, 0.0)
+    team_rec = team_tds * pass_share
+    team_rush = team_tds * (1.0 - pass_share)
+    gl_share, _ = _usage_baseline(usage, "gl_carry_share")
+    rz_share, _ = _usage_baseline(usage, "rz_target_share")
+    h_rush, h_rec, n_hist = player_td_history(proj.gsis_id, ctx.season, ctx.week)
+    opp = proj.opponent
+    td_mult = _mult(ctx, opp, "rz_td_rate_allowed")
+
+    steps = [
+        MathStep("5.3 environment", "team expected TDs", team_tds),
+        MathStep("5.6 touchdowns", "team passing share of TDs", pass_share, "shrunk toward league 0.614"),
+        MathStep("5.6 touchdowns", "team expected rushing TDs", team_rush),
+        MathStep("5.6 touchdowns", "team expected receiving TDs", team_rec),
+        MathStep("5.6 touchdowns", "goal-line carry share", gl_share),
+        MathStep("5.6 touchdowns", "red-zone target share", rz_share),
+        MathStep("5.6 touchdowns", "historical share of team rushing TDs", h_rush, f"{n_hist} games"),
+        MathStep("5.6 touchdowns", "historical share of team receiving TDs", h_rec, f"{n_hist} games"),
+    ]
+
+    if model is None:
+        # Before the first calibration: usage shares straight, one side each.
+        lam = team_rush * gl_share + (0.0 if rushing_only else team_rec * rz_share)
+        steps.append(MathStep("5.6 touchdowns", "lambda (uncalibrated fallback)", lam))
+    else:
+        rush_share = model.rush_share(gl_share, h_rush)
+        rec_share = 0.0 if rushing_only else model.rec_share(rz_share, h_rec)
+        lam = team_rush * rush_share + team_rec * rec_share
+        steps.append(MathStep("5.6 touchdowns", "fitted rushing-TD share", rush_share,
+                              f"a={model.rush[0]:.3f} b={model.rush[1]:.3f} c={model.rush[2]:.3f}"))
+        if not rushing_only:
+            steps.append(MathStep("5.6 touchdowns", "fitted receiving-TD share", rec_share,
+                                  f"a={model.rec[0]:.3f} b={model.rec[1]:.3f} c={model.rec[2]:.3f}"))
+    lam *= td_mult
+    steps.append(MathStep("5.2 opponent", "red-zone TD rate allowed", td_mult, opp))
+    steps.append(MathStep("5.6 touchdowns", "lambda", lam))
+    steps.append(MathStep("5.6 touchdowns", "P(anytime TD)", 1 - np.exp(-lam), "1 - e^-lambda"))
+    return float(max(lam, 0.0)), steps
 
 
 def _make(
@@ -751,17 +950,16 @@ def project_player(gsis_id: str, ctx: ProjectionContext) -> PlayerProjection | N
             or 0.0
         )
 
-    with connect() as con:
-        inj = con.execute(
-            "SELECT injury_status, practice_participation FROM injury_status "
-            "WHERE gsis_id = ? ORDER BY CASE WHEN source='sleeper' THEN 0 ELSE 1 END LIMIT 1",
-            [gsis_id],
-        ).fetchone()
+    from backend.models.ranking import _injury_state
+
+    state = _injury_state(ctx.season, ctx.week).get(gsis_id)
+    inj = (state["injury_status"], state["practice_participation"]) if state else None
 
     play = injury_lookup(
         report_status=inj[0] if inj else None,
         practice_status=inj[1] if inj else None,
         prior_snap_share=prior_snap,
+        position_group=_pg or None,
         gsis_id=gsis_id,
     )
 
@@ -878,7 +1076,6 @@ def _project_qb(proj, history, usage, env, ctx, wind_mult) -> None:
     # -- that ratio is ~0.97 for a pocket passer and turned 3.3 expected team TDs into a lambda of
     # 3.0, more than double the league-average 1.5 the reference doc reports.
     td_base = _baseline_for(history, "passing_tds", ctx.season)
-    rush_td_base = _baseline_for(history, "rushing_tds", ctx.season)
     team_tds = env["expected_team_tds"]
     pass_share = _passing_td_share(proj.team, ctx, td_base.mean)
     td_mult = _mult(ctx, opp, "pass_td_rate_allowed")
@@ -932,14 +1129,11 @@ def _project_qb(proj, history, usage, env, ctx, wind_mult) -> None:
         fallback_yards=ypa / max(comp_rate, 0.1),
     )
 
-    gl_share, _ = _usage_baseline(usage, "gl_carry_share")
-    lam_rush_td = team_tds * float(np.clip(gl_share if gl_share > 0 else rush_td_base.mean / max(team_tds, 1e-6), 0.0, 0.6)) * _mult(ctx, opp, "rush_td_rate_allowed")
+    lam_rush_td, td_steps = _td_lambda(proj, usage, env, ctx, rushing_only=True)
     proj.conditional["anytime_rush_td"] = _make(
         "anytime_rush_td", pos, fit_anytime_td(lam_rush_td),
-        [MathStep("5.6 touchdowns", "goal-line carry share", gl_share),
-         MathStep("5.6 touchdowns", "lambda", lam_rush_td,
-                  "rushing scores only; a passing TD never counts"),
-         MathStep("5.6 touchdowns", "P(anytime rushing TD)", 1 - np.exp(-lam_rush_td), "1 - e^-lambda")],
+        [*td_steps, MathStep("5.6 touchdowns", "rushing scores only", 1.0,
+                             "a passing TD never counts")],
         proj.play,
     )
 
@@ -976,7 +1170,11 @@ def _project_rb(proj, history, usage, env, ctx, wind_mult) -> None:
     )
 
     target_share, _ = _usage_baseline(usage, "target_share")
-    team_targets = env["expected_pass_attempts"]
+    rec_steps_pre: list[MathStep] = []
+    target_share = _redistributed_target_share(
+        target_share, proj.gsis_id, proj.team, "RB", ctx, rec_steps_pre
+    )
+    team_targets = _expected_targets(env, ctx)
     tgt_mult = _mult(ctx, opp, "rec_volume_allowed_rb")
     targets = team_targets * target_share * tgt_mult
 
@@ -984,8 +1182,10 @@ def _project_rb(proj, history, usage, env, ctx, wind_mult) -> None:
     catch_rate = catch_rate if catch_rate > 0 else 0.75
     receptions = targets * catch_rate
     rec_steps = [
-        MathStep("5.3 environment", "team expected pass attempts", team_targets),
+        MathStep("5.3 environment", "team expected targets", team_targets,
+                 "attempts x measured targets-per-attempt"),
         MathStep("5.4 usage", "target share", target_share),
+        *rec_steps_pre,
         MathStep("5.2 opponent", "RB receptions allowed multiplier", tgt_mult, opp),
         MathStep("5.5 efficiency", "catch rate", catch_rate, f"{n} games"),
         MathStep("5.4 usage", "projected receptions", receptions),
@@ -1020,24 +1220,8 @@ def _project_rb(proj, history, usage, env, ctx, wind_mult) -> None:
         "longest_rush", pos, carries, proj.gsis_id, "rush", ctx, [], proj.play, fallback_yards=ypc,
     )
 
-    gl_share, _ = _usage_baseline(usage, "gl_carry_share")
-    rz_tgt_share, _ = _usage_baseline(usage, "rz_target_share")
-    # Goal-line role dominates: 86.6% of rushing TDs since 2010 came from inside the red zone and
-    # 57.4% from inside the 5, so total touches are the wrong basis (§5.6).
-    td_share = 0.75 * gl_share + 0.25 * rz_tgt_share
-    td_mult = _mult(ctx, opp, "rz_td_rate_allowed")
-    lam_td = env["expected_team_tds"] * float(np.clip(td_share, 0.0, 0.85)) * td_mult
-    proj.conditional["anytime_td"] = _make(
-        "anytime_td", pos, fit_anytime_td(lam_td),
-        [MathStep("5.6 touchdowns", "goal-line carry share", gl_share),
-         MathStep("5.6 touchdowns", "red-zone target share", rz_tgt_share),
-         MathStep("5.6 touchdowns", "blended TD share", td_share, "0.75 goal line + 0.25 red-zone targets"),
-         MathStep("5.3 environment", "team expected TDs", env["expected_team_tds"]),
-         MathStep("5.2 opponent", "red-zone TD rate allowed", td_mult, opp),
-         MathStep("5.6 touchdowns", "lambda", lam_td),
-         MathStep("5.6 touchdowns", "P(anytime TD)", 1 - np.exp(-lam_td), "1 - e^-lambda")],
-        proj.play,
-    )
+    lam_td, td_steps = _td_lambda(proj, usage, env, ctx, rushing_only=False)
+    proj.conditional["anytime_td"] = _make("anytime_td", pos, fit_anytime_td(lam_td), td_steps, proj.play)
 
 
 def _project_receiver(proj, history, usage, env, ctx, wind_mult) -> None:
@@ -1047,11 +1231,16 @@ def _project_receiver(proj, history, usage, env, ctx, wind_mult) -> None:
     suffix = "wr" if pos == "WR" else "te"
 
     target_share, _ = _usage_baseline(usage, "target_share")
+    pre: list[MathStep] = []
+    target_share = _redistributed_target_share(target_share, proj.gsis_id, proj.team, pos, ctx, pre)
     tgt_mult = _mult(ctx, opp, f"target_volume_allowed_{suffix}")
-    targets = env["expected_pass_attempts"] * target_share * tgt_mult
+    team_targets = _expected_targets(env, ctx)
+    targets = team_targets * target_share * tgt_mult
     steps = [
-        MathStep("5.3 environment", "team expected pass attempts", env["expected_pass_attempts"]),
+        MathStep("5.3 environment", "team expected targets", team_targets,
+                 "attempts x measured targets-per-attempt"),
         MathStep("5.4 usage", "target share", target_share),
+        *pre,
         MathStep("5.2 opponent", f"targets allowed to {pos}s multiplier", tgt_mult, opp),
         MathStep("5.4 usage", "projected targets", targets),
     ]
@@ -1092,21 +1281,8 @@ def _project_receiver(proj, history, usage, env, ctx, wind_mult) -> None:
             fallback_yards=ypt / max(catch_rate, 0.1),
         )
 
-    rz_share, _ = _usage_baseline(usage, "rz_target_share")
-    td_mult = _mult(ctx, opp, "rz_td_rate_allowed")
-    # Red-zone target share, not total yardage: 25%+ is the reliability threshold in the reference.
-    lam_td = env["expected_team_tds"] * float(np.clip(rz_share, 0.0, 0.6)) * td_mult * 0.62
-    proj.conditional["anytime_td"] = _make(
-        "anytime_td", pos, fit_anytime_td(lam_td),
-        [MathStep("5.6 touchdowns", "red-zone target share", rz_share),
-         MathStep("5.3 environment", "team expected TDs", env["expected_team_tds"]),
-         MathStep("5.2 opponent", "red-zone TD rate allowed", td_mult, opp),
-         MathStep("5.6 touchdowns", "share of team TDs that are receiving", 0.62,
-                  "league split of receiving vs rushing scores"),
-         MathStep("5.6 touchdowns", "lambda", lam_td),
-         MathStep("5.6 touchdowns", "P(anytime TD)", 1 - np.exp(-lam_td), "1 - e^-lambda")],
-        proj.play,
-    )
+    lam_td, td_steps = _td_lambda(proj, usage, env, ctx, rushing_only=False)
+    proj.conditional["anytime_td"] = _make("anytime_td", pos, fit_anytime_td(lam_td), td_steps, proj.play)
 
 
 def _project_kicker(proj, history, usage, env, ctx, wind_mult) -> None:
@@ -1147,11 +1323,12 @@ def _project_kicker(proj, history, usage, env, ctx, wind_mult) -> None:
         "fg_made", pos, _scaled_poisson(pos, "fg_made", fg_made, made_steps), made_steps, proj.play
     )
 
-    xp = env["expected_team_tds"] * XP_PER_TD
+    xp_rate = _xp_per_td(ctx.constants)
+    xp = env["expected_team_tds"] * xp_rate
     proj.conditional["xp_made"] = _make(
         "xp_made", pos, _scaled_poisson(pos, "xp_made", xp, []),
         [MathStep("5.3 environment", "team expected TDs", env["expected_team_tds"]),
-         MathStep("5.6 kicking", "XP conversion net of two-point tries", XP_PER_TD),
+         MathStep("5.6 kicking", "XP made per TD (measured; net of 2-pt tries and misses)", xp_rate),
          MathStep("5.6 kicking", "projected XP made", xp)],
         proj.play,
     )
@@ -1224,11 +1401,11 @@ def _project_lb(proj, history, usage, env, ctx, wind_mult) -> None:
     pressure_mult = _mult(ctx, opp, "pressure_allowed")
     lam_sacks = max(sack_base.mean, 0.01) * pressure_mult
     proj.conditional["sacks"] = _make(
-        "sacks", pos, _scaled_poisson(pos, "sacks", lam_sacks, []),
+        "sacks", pos, fit_poisson(lam_sacks, unit=0.5),
         [MathStep("5.1 baseline", "recency-weighted sacks", sack_base.mean, f"{sack_base.n_games} games"),
          MathStep("5.2 opponent", "sacks allowed by opponent multiplier", pressure_mult, opp),
          MathStep("5.6 touchdowns", "lambda", lam_sacks,
-                  "high variance: even elite rushers post frequent zero-sack games")],
+                  "Poisson on HALF-sacks: 17.5% of sack credits are 0.5 (D9); high variance")],
         proj.play,
     )
 
@@ -1248,32 +1425,52 @@ def _project_lb(proj, history, usage, env, ctx, wind_mult) -> None:
 def _add_unconditional(proj: PlayerProjection) -> None:
     """Mirror every conditional projection into an unconditional one (§5.7).
 
-    ``E[X] = P(played) · E[X | played]``, and the variance picks up the play/don't-play mixture, so
-    a coin-flip Questionable shows the wide band that uncertainty actually implies.
+    The unconditional outcome is a two-component mixture: with probability ``1 - p`` the player
+    does not play and every counting stat is 0; with probability ``p`` he plays at ``s`` times
+    his usual usage. Both moments follow, and the fitted family carries them:
+
+        E[X]   = p · s · mu
+        Var[X] = p · (s² var + s² mu²) − (p s mu)²
+
+    Two things this replaced. A Poisson refit at ``lambda · p`` had the right mean and the wrong
+    everything else -- no mass at zero beyond e^-lambda, half the true variance, P(over 5) of
+    0.14 against 0.26 for a coin-flip McCaffrey. And the anytime-TD probability was ``1 −
+    e^(−lambda p)``; because ``1 − e^(−x)`` is concave that is always too high, by nine points
+    at his lambda. It is ``p · (1 − e^(−lambda s))``.
+
+    ``s`` is the measured snap RATIO for the player's cell (a Questionable starter who plays keeps
+    ~93% of his usual snaps), not a population mean divided by his own share, which cut a
+    95%-snap starter by a fifth.
     """
     p = proj.play.p_played
-    # E[snap share | played] is an ABSOLUTE share, so it must be compared to the player's own
-    # normal share rather than applied on top of a baseline that already reflects it. A 90%-snap
-    # receiver expected at 76% loses 16% of his usage, not 24%.
-    normal = float(proj.context.get("prior_snap_share") or 0.0)
-    expected = float(proj.play.expected_snap_share or 0.0)
-    if normal > 0.05 and expected > 0:
-        snap_scale = float(np.clip(expected / normal, 0.5, 1.0))
-    else:
-        snap_scale = 1.0
-    proj.context["snap_scale"] = snap_scale
+    s = float(np.clip(proj.play.snap_ratio or 1.0, 0.5, 1.0)) if p < 1.0 else 1.0
+    proj.context["snap_scale"] = s
 
     for stat, sp in proj.conditional.items():
         dist = sp.distribution
         if dist.family is Family.BERNOULLI:
-            lam = dist.params["lam"] * p * snap_scale
-            new = fit_anytime_td(lam)
-        elif dist.family is Family.POISSON:
-            new = fit_poisson(apply_unconditional(dist.params["lam"], p) * snap_scale)
-        elif dist.family is Family.NEGATIVE_BINOMIAL:
-            mean = apply_unconditional(dist.mean, p) * snap_scale
-            var = inflate_variance_for_uncertainty(dist.mean * snap_scale, dist.params["variance"], p)
-            new = fit_negative_binomial(max(mean, 1e-6), max(var, mean * 1.05))
+            lam = dist.params["lam"] * s
+            p_event = p * (1.0 - float(np.exp(-lam)))
+            new = Distribution(
+                family=Family.BERNOULLI,
+                params={"p": p_event, "lam": lam, "play_probability": p},
+                mean=p_event,
+                integer_valued=True,
+            )
+        elif dist.family in (Family.POISSON, Family.NEGATIVE_BINOMIAL):
+            mu = float(dist.mean) * s
+            var_c = float(dist.params.get("variance", dist.mean)) * s * s
+            mean = apply_unconditional(mu, p)
+            var = inflate_variance_for_uncertainty(mu, var_c, p)
+            unit = float(dist.params.get("unit", 1.0) or 1.0)
+            if p >= 0.999 and dist.family is Family.POISSON:
+                new = fit_poisson(mean, unit=unit)
+            elif unit != 1.0:
+                # Half-sack units: keep the Poisson form at the mixture mean; the extra
+                # dispersion from absence is second-order at these lambdas.
+                new = fit_poisson(mean, unit=unit)
+            else:
+                new = fit_negative_binomial(max(mean, 1e-6), max(var, mean * 1.05))
         else:
             # Monte Carlo and deterministic families are already distributions over outcomes;
             # scaling their parameters is not meaningful, so they carry through unchanged and are
@@ -1283,7 +1480,7 @@ def _add_unconditional(proj: PlayerProjection) -> None:
         steps = [
             *sp.steps,
             MathStep("5.7 injury", "P(played)", p, proj.play.source),
-            MathStep("5.7 injury", "E[snap share | played]", snap_scale, proj.play.role),
+            MathStep("5.7 injury", "usage kept if he plays (snap ratio)", s, proj.play.role),
         ]
         proj.unconditional[stat] = StatProjection(
             stat=stat, position=sp.position, distribution=new,

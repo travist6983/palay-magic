@@ -133,8 +133,12 @@ export function probOver(dist: DistributionParams, line: number): number {
   switch (dist.family) {
     case 'negative_binomial':
       return clamp01(1 - nbinomCdf(Math.floor(line), p.r, p.p))
-    case 'poisson':
-      return clamp01(1 - poissonCdf(Math.floor(line), p.lam))
+    case 'poisson': {
+      // Sacks are a Poisson on HALF-sacks (unit 0.5): the count is Poisson(lam / unit) and the
+      // value is count x unit, so P(value > line) = P(count > line / unit).
+      const unit = p.unit && p.unit > 0 ? p.unit : 1
+      return clamp01(1 - poissonCdf(Math.floor(line / unit + 1e-9), p.lam / unit))
+    }
     case 'bernoulli':
       return line < 1 ? clamp01(p.p) : 0
     case 'empirical_max': {
@@ -166,15 +170,34 @@ export function probOver(dist: DistributionParams, line: number): number {
 
 /** P(X = line). Non-zero only for an integer-valued stat at a whole number. */
 export function probExact(dist: DistributionParams, line: number): number {
-  if (!dist.integer_valued || !Number.isInteger(line)) return 0
   const p = dist.params
+  if (dist.family === 'poisson') {
+    const unit = p.unit && p.unit > 0 ? p.unit : 1
+    const count = line / unit
+    if (Math.abs(count - Math.round(count)) > 1e-9) return 0
+    return clamp01(poissonPmf(Math.round(count), p.lam / unit))
+  }
+  if (dist.family === 'deterministic') {
+    // Kicking points have an enumerated support; a push at an integer line is a real outcome.
+    const support: number[] = p.support ?? []
+    const probs: number[] = p.probs ?? []
+    let mass = 0
+    for (let i = 0; i < support.length; i++) if (Math.abs(support[i] - line) < 1e-9) mass += probs[i]
+    return clamp01(mass)
+  }
+  if (!dist.integer_valued || !Number.isInteger(line)) return 0
   switch (dist.family) {
     case 'negative_binomial':
       return clamp01(nbinomPmf(line, p.r, p.p))
-    case 'poisson':
-      return clamp01(poissonPmf(line, p.lam))
     case 'bernoulli':
       return line === 1 ? clamp01(p.p) : line === 0 ? clamp01(1 - p.p) : 0
+    case 'empirical_max': {
+      const samples: number[] = p.samples_sorted ?? []
+      if (!samples.length) return 0
+      let hits = 0
+      for (const v of samples) if (Math.abs(v - line) < 1e-9) hits += 1
+      return clamp01(hits / samples.length)
+    }
     default:
       return 0
   }
@@ -191,15 +214,15 @@ export function quantile(dist: DistributionParams, q: number): number {
   switch (dist.family) {
     case 'poisson':
     case 'negative_binomial': {
-      const mean = dist.mean
-      const limit = Math.max(10, Math.ceil(mean * 12 + 40))
+      const unit = dist.family === 'poisson' && p.unit && p.unit > 0 ? p.unit : 1
+      const lam = dist.family === 'poisson' ? p.lam / unit : dist.mean
+      const limit = Math.max(10, Math.ceil(lam * 12 + 40))
       let cumulative = 0
       for (let k = 0; k <= limit; k++) {
-        cumulative +=
-          dist.family === 'poisson' ? poissonPmf(k, p.lam) : nbinomPmf(k, p.r, p.p)
-        if (cumulative >= q) return k
+        cumulative += dist.family === 'poisson' ? poissonPmf(k, lam) : nbinomPmf(k, p.r, p.p)
+        if (cumulative >= q) return k * unit
       }
-      return limit
+      return limit * unit
     }
     case 'bernoulli':
       return q > 1 - p.p ? 1 : 0
@@ -246,16 +269,18 @@ export function densityCurve(dist: DistributionParams, points = 60): { x: number
     return histogram(samples, Math.min(points, 40))
   }
 
+  const unit = dist.family === 'poisson' && p.unit && p.unit > 0 ? p.unit : 1
+  const lam = dist.family === 'poisson' ? p.lam / unit : dist.mean
   const lo = 0
-  const hi = Math.max(1, Math.ceil(quantile(dist, 0.995)))
+  const hi = Math.max(1, Math.ceil(quantile(dist, 0.995) / unit))
   const step = Math.max(1, Math.round((hi - lo) / points))
   const out: { x: number; y: number }[] = []
   for (let k = lo; k <= hi; k += step) {
     let y = 0
     for (let j = k; j < k + step; j++) {
-      y += dist.family === 'poisson' ? poissonPmf(j, p.lam) : nbinomPmf(j, p.r, p.p)
+      y += dist.family === 'poisson' ? poissonPmf(j, lam) : nbinomPmf(j, p.r, p.p)
     }
-    out.push({ x: k, y })
+    out.push({ x: k * unit, y })
   }
   return out
 }

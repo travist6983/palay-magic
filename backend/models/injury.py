@@ -47,13 +47,13 @@ UNCERTAIN_STATUSES: frozenset[str] = frozenset({"Questionable"})
 FALLBACK_PLAY_RATES: dict[tuple[str, str], float] = {
     ("Questionable", "Full"): 0.85,
     ("Questionable", "Limited"): 0.74,
-    ("Questionable", "Did Not Participate In Practice"): 0.54,
+    ("Questionable", "DNP"): 0.54,
     ("Doubtful", "Full"): 0.35,
     ("Doubtful", "Limited"): 0.25,
-    ("Doubtful", "Did Not Participate In Practice"): 0.10,
+    ("Doubtful", "DNP"): 0.10,
     ("Out", "Full"): 0.0,
     ("Out", "Limited"): 0.0,
-    ("Out", "Did Not Participate In Practice"): 0.0,
+    ("Out", "DNP"): 0.0,
 }
 
 MIN_CELL_OBSERVATIONS = 30
@@ -114,6 +114,10 @@ class PlayProbability:
     role: str = "starter"
     """Which role bucket the rate came from. See :func:`role_bucket`."""
 
+    snap_ratio: float = 1.0
+    """E[snap share / normal share | played]. The usage multiplier for an active-but-limited
+    player: a Questionable starter who suits up keeps ~93% of his usual snaps."""
+
     def to_json(self) -> dict[str, object]:
         return {
             "report_status": self.report_status,
@@ -124,6 +128,7 @@ class PlayProbability:
             "source": self.source,
             "excluded": self.excluded,
             "role": self.role,
+            "snap_ratio": self.snap_ratio,
         }
 
 
@@ -166,7 +171,10 @@ def compute_play_rates(seasons: list[int] | None = None) -> pl.DataFrame:
             p.gsis_id,
             greatest(coalesce(s.offense_pct, 0), coalesce(s.defense_pct, 0)) AS snap_share,
             (coalesce(s.offense_snaps, 0) + coalesce(s.defense_snaps, 0)
-                 + coalesce(s.st_snaps, 0)) AS total_snaps
+                 + coalesce(s.st_snaps, 0)) AS total_snaps,
+            -- Absolute game order across seasons, so "the last four games" can cross a season
+            -- boundary the same way ranking.py's application of this table does.
+            s.season * 100 + s.week AS game_key
         FROM raw_snap_counts s
         JOIN players p ON p.pfr_id = s.pfr_player_id
         WHERE s.season IN ({season_list})
@@ -177,8 +185,17 @@ def compute_play_rates(seasons: list[int] | None = None) -> pl.DataFrame:
             i.week,
             i.gsis_id,
             i.report_status,
-            coalesce(i.practice_status, 'Unknown') AS practice_status,
-            coalesce(pl.position_group, i.position, 'UNK') AS position_group
+            -- Normalised to the same three tokens Sleeper emits ('Full' / 'Limited' / 'DNP'), so a
+            -- live designation can actually find its cell. The long nflverse strings never matched.
+            CASE
+                WHEN lower(coalesce(i.practice_status, '')) LIKE 'full%' THEN 'Full'
+                WHEN lower(coalesce(i.practice_status, '')) LIKE 'limited%' THEN 'Limited'
+                WHEN lower(coalesce(i.practice_status, '')) LIKE 'did not%' THEN 'DNP'
+                WHEN coalesce(i.practice_status, '') = '' THEN 'Unknown'
+                ELSE i.practice_status
+            END AS practice_status,
+            coalesce(pl.position_group, i.position, 'UNK') AS position_group,
+            i.season * 100 + i.week AS game_key
         FROM raw_injuries i
         LEFT JOIN players pl ON pl.gsis_id = i.gsis_id
         WHERE i.gsis_id IS NOT NULL
@@ -186,17 +203,22 @@ def compute_play_rates(seasons: list[int] | None = None) -> pl.DataFrame:
           AND i.report_status IS NOT NULL
           AND i.report_status <> 'Note'
     ),
-    -- Prior-four-week role, computed off the spine so it does not depend on this week's snaps.
+    -- Role = mean snap share over the player's last FOUR GAMES before this one, any season.
+    -- This is exactly how ranking.py buckets a live player, so the table is fitted on the
+    -- definition it is applied with. Fitting on same-season weeks w-4..w-1 put every Week-1
+    -- starter in 'no_recent_games' at 53% when his true rate was 63-68%.
     role AS (
         SELECT
             sp.season, sp.week, sp.gsis_id,
             avg(prior.snap_share) AS prior_share,
             count(prior.snap_share) AS n_prior_games
         FROM spine sp
-        LEFT JOIN snaps prior
-               ON prior.gsis_id = sp.gsis_id
-              AND prior.season = sp.season
-              AND prior.week BETWEEN sp.week - 4 AND sp.week - 1
+        LEFT JOIN (
+            SELECT a.gsis_id, a.game_key AS target_key, b.snap_share,
+                   row_number() OVER (PARTITION BY a.gsis_id, a.game_key ORDER BY b.game_key DESC) AS rn
+            FROM (SELECT DISTINCT gsis_id, game_key FROM spine) a
+            JOIN snaps b ON b.gsis_id = a.gsis_id AND b.game_key < a.game_key
+        ) prior ON prior.gsis_id = sp.gsis_id AND prior.target_key = sp.game_key AND prior.rn <= 4
         GROUP BY 1, 2, 3
     ),
     joined AS (
@@ -211,7 +233,9 @@ def compute_play_rates(seasons: list[int] | None = None) -> pl.DataFrame:
                 ELSE 'fringe'
             END AS role_bucket,
             CASE WHEN coalesce(cur.total_snaps, 0) > 0 THEN 1 ELSE 0 END AS played,
-            cur.snap_share
+            cur.snap_share,
+            CASE WHEN coalesce(cur.total_snaps, 0) > 0 AND r.prior_share > 0.05
+                 THEN least(cur.snap_share / r.prior_share, 1.5) END AS snap_ratio
         FROM spine sp
         LEFT JOIN role  r   ON r.gsis_id = sp.gsis_id AND r.season = sp.season AND r.week = sp.week
         LEFT JOIN snaps cur ON cur.gsis_id = sp.gsis_id AND cur.season = sp.season AND cur.week = sp.week
@@ -221,7 +245,8 @@ def compute_play_rates(seasons: list[int] | None = None) -> pl.DataFrame:
                count(*) AS n_observations, sum(played) AS n_played,
                sum(played)::DOUBLE / count(*) AS p_played,
                avg(CASE WHEN played = 1 THEN snap_share END) AS mean_snap_share,
-               stddev_samp(CASE WHEN played = 1 THEN snap_share END) AS sd_snap_share
+               stddev_samp(CASE WHEN played = 1 THEN snap_share END) AS sd_snap_share,
+               avg(snap_ratio) AS mean_snap_ratio
         FROM joined GROUP BY 1, 2, 3, 4
     ),
     marginal AS (
@@ -229,7 +254,8 @@ def compute_play_rates(seasons: list[int] | None = None) -> pl.DataFrame:
                count(*) AS n_observations, sum(played) AS n_played,
                sum(played)::DOUBLE / count(*) AS p_played,
                avg(CASE WHEN played = 1 THEN snap_share END) AS mean_snap_share,
-               stddev_samp(CASE WHEN played = 1 THEN snap_share END) AS sd_snap_share
+               stddev_samp(CASE WHEN played = 1 THEN snap_share END) AS sd_snap_share,
+               avg(snap_ratio) AS mean_snap_ratio
         FROM joined GROUP BY 1, 2, 3
     )
     SELECT * FROM by_position
@@ -246,9 +272,9 @@ def compute_play_rates(seasons: list[int] | None = None) -> pl.DataFrame:
             """
             INSERT INTO injury_play_rates
                 (report_status, practice_status, role_bucket, position_group, n_observations,
-                 n_played, p_played, mean_snap_share, sd_snap_share, computed_at)
+                 n_played, p_played, mean_snap_share, sd_snap_share, mean_snap_ratio, computed_at)
             SELECT report_status, practice_status, role_bucket, position_group, n_observations,
-                   n_played, p_played, mean_snap_share, sd_snap_share, now()
+                   n_played, p_played, mean_snap_share, sd_snap_share, mean_snap_ratio, now()
             FROM tmp_rates
             """
         )
@@ -327,8 +353,11 @@ def lookup(
     if report_status in EXCLUDED_STATUSES and report_status != "Doubtful":
         return PlayProbability(gsis_id, report_status, practice_status, 0.0, 0.0, 0, "rule", True, ROLE_STARTER)
 
-    practice = practice_status or "Unknown"
+    practice = practice_participation_signal(practice_status)
     role = role_bucket(prior_snap_share)
+    cols = "sum(n_observations), sum(n_played)::DOUBLE / nullif(sum(n_observations), 0), " \
+           "sum(mean_snap_share * n_played) / nullif(sum(n_played), 0), " \
+           "sum(mean_snap_ratio * n_played) / nullif(sum(n_played), 0)"
 
     def _result(row, source: str) -> PlayProbability:
         return PlayProbability(
@@ -341,27 +370,40 @@ def lookup(
             source=source,
             excluded=excluded,
             role=role,
+            snap_ratio=float(row[3]) if row[3] is not None else 1.0,
         )
 
     with connect() as con:
         if position_group:
             row = con.execute(
-                "SELECT n_observations, p_played, mean_snap_share FROM injury_play_rates "
+                f"SELECT {cols} FROM injury_play_rates "
                 "WHERE report_status = ? AND practice_status = ? AND role_bucket = ? "
                 "  AND position_group = ?",
                 [report_status, practice, role, position_group],
             ).fetchone()
-            if row and row[0] >= MIN_CELL_OBSERVATIONS:
+            if row and row[0] and row[0] >= MIN_CELL_OBSERVATIONS:
                 return _result(row, "empirical:position")
 
         row = con.execute(
-            "SELECT n_observations, p_played, mean_snap_share FROM injury_play_rates "
+            f"SELECT {cols} FROM injury_play_rates "
             "WHERE report_status = ? AND practice_status = ? AND role_bucket = ? "
             "  AND position_group = 'ALL'",
             [report_status, practice, role],
         ).fetchone()
-        if row and row[0] >= MIN_CELL_OBSERVATIONS:
+        if row and row[0] and row[0] >= MIN_CELL_OBSERVATIONS:
             return _result(row, "empirical:role")
+
+        # (status, role, POSITION) across practice statuses. Quarterbacks are the case that
+        # matters: a Questionable QB starter plays 44.6% of the time against 71% for starters at
+        # large, and without this level that cell was unreachable.
+        if position_group:
+            row = con.execute(
+                f"SELECT {cols} FROM injury_play_rates "
+                "WHERE report_status = ? AND role_bucket = ? AND position_group = ?",
+                [report_status, role, position_group],
+            ).fetchone()
+            if row and row[0] and row[0] >= MIN_CELL_OBSERVATIONS:
+                return _result(row, "empirical:position_marginal")
 
         # Marginalise over practice status, KEEPING the role. This is the case that matters most
         # in practice: before Wednesday of game week there is no practice report at all, and the
@@ -369,9 +411,7 @@ def lookup(
         # holding role fixed keeps the dimension that actually moves the number (D11) -- a
         # Questionable starter lands near 72% instead of the cross-role 61%.
         row = con.execute(
-            "SELECT sum(n_observations), sum(n_played)::DOUBLE / nullif(sum(n_observations), 0), "
-            "       sum(mean_snap_share * n_played) / nullif(sum(n_played), 0) "
-            "FROM injury_play_rates "
+            f"SELECT {cols} FROM injury_play_rates "
             "WHERE report_status = ? AND role_bucket = ? AND position_group = 'ALL'",
             [report_status, role],
         ).fetchone()
@@ -379,9 +419,7 @@ def lookup(
             return _result(row, "empirical:role_marginal")
 
         row = con.execute(
-            "SELECT sum(n_observations), sum(n_played)::DOUBLE / nullif(sum(n_observations), 0), "
-            "       sum(mean_snap_share * n_played) / nullif(sum(n_played), 0) "
-            "FROM injury_play_rates "
+            f"SELECT {cols} FROM injury_play_rates "
             "WHERE report_status = ? AND practice_status = ? AND position_group = 'ALL'",
             [report_status, practice],
         ).fetchone()
@@ -393,7 +431,7 @@ def lookup(
         )
         return _result(row, "empirical:pooled")
 
-    fallback = FALLBACK_PLAY_RATES.get((report_status, practice_participation_signal(practice)))
+    fallback = FALLBACK_PLAY_RATES.get((report_status, practice))
     if fallback is None:
         fallback = 0.0 if excluded else 1.0
     return PlayProbability(
@@ -510,7 +548,7 @@ def practice_participation_signal(practice_status: str | None) -> str:
     if s.startswith("limited"):
         return "Limited"
     if "did not" in s or s in {"dnp", "out"}:
-        return "Did Not Participate In Practice"
+        return "DNP"
     return practice_status.strip()
 
 

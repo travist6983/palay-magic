@@ -215,3 +215,96 @@ several of them rank 1 or 2.
 
 `build_rankings` now normalises through `injury.NON_DESIGNATIONS` before storing. Doing it at the
 source means no consumer has to keep its own copy of the list in step.
+
+---
+
+# Review pass (2026-09-06): what the equations got wrong
+
+A full review of the modelling code — five module reviewers executing the maths against the
+database, plus an independent check of the backtest tables — found 19 defects in the equations
+and predictions. All are fixed; the ones that changed a number materially are recorded here.
+
+## D16. The anytime-TD share is fitted, not a raw usage fraction
+
+§5.6 says `λ = expected_team_TDs × player_TD_share` from red-zone target share and goal-line
+carry share. That structure was kept; the hand-set weights (`0.75·gl + 0.25·rz` against all team
+touchdowns, `0.62` for receivers) were not a share and were badly off on a 2025 replay:
+
+| Position | Predicted P(TD) | Realised | Bias |
+|---|---|---|---|
+| QB rushing | 28.7% | 14.1% | +14.6pp |
+| RB | 69.9% | 58.5% | +11.5pp |
+| TE | 27.2% | 40.5% | −13.3pp |
+
+A constant at the positional base rate beat every raw-share λ on log-loss. The share is now a
+fitted linear function of the usage signals — separately for rushing and receiving scores, each
+against that side's expected team touchdowns — with the fit weighted by trailing usage so the
+players the app projects dominate it (`backend/models/touchdowns.py`). Held-out 2025, top-20%
+usage: RB +0.8pp, WR +0.4pp, TE −7.9pp, QB +7.7pp. TE and QB remain the weakest cells.
+
+## D17. Team targets, not team attempts
+
+`target_share` is defined against team *targets* (`gamelog.py`) but was multiplied by expected
+pass *attempts*. Official targets are 95.4% of attempts (throwaways, spikes, batted balls), so
+every target, reception and receiving-yard projection ran ~4.9% high. `expected_targets =
+attempts × measured targets-per-attempt`, stored with the other measured constants.
+
+## D18. Ridge calibration scores the rated side alone
+
+`tune_ridge` and `_walk_forward_scores` scored the full two-way prediction — offence effect plus
+defence effect — but the projection only ever applies the defence effect. The credited MSE
+reduction was mostly the *offence's* predictability: `rec_volume_allowed_te` read 9.8% of which
+9.3% was the faced side and 0.7% the defence.
+
+Scored honestly, the best defensive signal removes 5.9% of MSE (`opp_pass_rate`) and three
+metrics are slightly negative out of sample — yards-per-target allowed to WRs and RBs, and FG
+attempts allowed. Those are pinned to a multiplier of 1.0 (`model = 'pinned:no_signal'`). The
+matchup signals the public treats as most decisive are the ones with no signal.
+
+## D19. The unconditional projection is a mixture, and it was not being built as one
+
+Three related errors in `_add_unconditional`:
+
+- A Poisson refit at `λ·p` had the right mean and the wrong shape: no absence mass at zero, half
+  the variance. McCaffrey receptions P(over 5): 0.14 stored vs 0.26 correct. Now the play /
+  don't-play mixture moments, carried by a negative binomial.
+- Anytime-TD used `1 − e^(−λp)`; because `1 − e^(−x)` is concave that is always high, by 9 points
+  at McCaffrey's λ. It is `p · (1 − e^(−λ))`.
+- The usage cut for an active-but-limited player divided a *population* mean snap share (0.762)
+  by the player's own share, cutting a 95%-snap starter by a fifth. The data says a Questionable
+  starter who plays keeps 93% of his usual snaps (median 100%); the measured ratio is now stored
+  per cell (`mean_snap_ratio`, migration 013) and used directly.
+
+## D20. Injury table: three fit/apply mismatches
+
+- Sleeper emits `Full` / `Limited` / `DNP`; the table stored nflverse's long strings. Live practice
+  status could never find its cell. Both sides now use the three tokens.
+- The role bucket was fitted on same-season weeks w−4..w−1 and applied over the last four games
+  of any season — so every Week-1 starter was fitted as `no_recent_games` (53%) and applied as
+  `starter` (71%) when his true rate was 63–68%. The fit now uses the cross-season window it is
+  applied with.
+- A `(status, role, position)` level was unreachable. Questionable QB starters play 44.6% of the
+  time; Mahomes was shown 71%. He now reads 39% via the QB cell.
+
+## D21. Replays use the official report for their week
+
+`injury_status` holds only the live snapshot with no date on it, and the backtest was stamping
+September-2026 designations onto 2024 and 2025 weeks. `_injury_state(season, week)` now reads
+`raw_injuries` for a historical week. Relatedly, `backtest --refit` overwrote the production
+ridge penalties and environment coefficients with 2023–24-only fits and never restored them; the
+live 2026 Week 1 had been built on those. Every replay now ends by refitting on the full history.
+
+## D22. Smaller corrections, all measured rather than assumed
+
+| Was | Is | Why |
+|---|---|---|
+| serve-time pace = all-time mean of every play | rolling mean of last-6 per-game medians, one helper for fit and serve | fit/serve statistics differed by ~5s; expected plays +2.3/game for every team |
+| `XP_PER_TD = 0.94` | 0.909 measured | 0.94 was *attempts*; omitted the make rate |
+| `expected_rush_attempts = plays − dropbacks` | fitted team rush-attempts model | dropped scrambles that `carry_share`'s denominator includes; RB carries −7% |
+| red-zone trip = any row inside the 20 | scrimmage snap or FG try inside the 20 | the XP row from the 15 made every long TD drive a red-zone conversion (2168 flagged vs 1794 real) |
+| `passes_defended → pass_volume_allowed` (a defence metric) | `opp_dropbacks` (opponent offence) | wrong unit |
+| integer Poisson for sacks | Poisson on half-sacks (`unit = 0.5`) | 17.5% of sack credits are exactly 0.5 |
+| `_pmf = 0` for kicking points, `integer_valued = False` | enumerated support, integer | P(under) at 9 was wrong by the 7% point mass |
+| kick-return TDs credited to the offence | excluded | nflverse sets posteam to the receiving team on kickoffs |
+| kneels and scrambles in the explosive-rush denominator | excluded | kneel share of carries faced ranges 0.75–7.1% across defences |
+| `redistribute_target_share` defined, never called | called; the position's slice split among healthy peers | an Out WR1 moved nobody; the first wiring handed the whole slice to *each* WR and put targets +2.6 |
