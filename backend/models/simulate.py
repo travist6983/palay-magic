@@ -44,8 +44,12 @@ DEFAULT_SIMS = 5000
 STORED_DRAWS = 1000
 """How many draws per player-stat are persisted. Enough to price a parlay, small enough to store."""
 
-# Yards needed for a field-goal attempt to be plausible, from the offence's own 35.
-FG_RANGE_YARDLINE = 38.0
+# Kick distance = yards to the goal line + 18 (7 for the snap, 10 for the end zone, +1 in the
+# nflverse convention); a try becomes plausible around 55 yards, i.e. from the 37.
+FG_RANGE_YARDLINE = 37.0
+KICK_DISTANCE_OFFSET = 18.0
+TURNOVER_PER_PLAY = 0.035
+STALL_AFTER_SHORT_GAIN = 0.22
 
 
 @dataclass
@@ -287,9 +291,12 @@ def _simulate_drive(
         is_pass = rng.random() < pass_rate
         gain = 0.0
 
-        if is_pass and qbs:
-            qb = qbs[0]
-            qb.stats["pass_attempts"][sim] += 1
+        if is_pass:
+            # 22 of 32 teams have no ranked QB; a pass must still be a pass for the receivers'
+            # sake. Only the quarterback's own line requires him to be on the board.
+            qb = qbs[0] if qbs else None
+            if qb is not None:
+                qb.stats["pass_attempts"][sim] += 1
             receiver = _pick(receivers, "target_share", rng)
             if receiver is not None:
                 receiver.stats["targets"][sim] += 1
@@ -297,8 +304,9 @@ def _simulate_drive(
                     gain = max(0.0, rng.exponential(max(receiver.yards_per_target / receiver.catch_rate, 1.0)))
                     receiver.stats["receptions"][sim] += 1
                     receiver.stats["receiving_yards"][sim] += gain
-                    qb.stats["completions"][sim] += 1
-                    qb.stats["passing_yards"][sim] += gain
+                    if qb is not None:
+                        qb.stats["completions"][sim] += 1
+                        qb.stats["passing_yards"][sim] += gain
         elif runners:
             runner = _pick(runners, "carry_share", rng)
             if runner is not None:
@@ -316,15 +324,18 @@ def _simulate_drive(
         if yardline <= 0:
             _score_touchdown(team, offense, qbs, receivers, runners, kickers, score, sim, rng, is_pass)
             return
-        if rng.random() < 0.12:  # turnover or a drive-ending sack
+        # Drive-ending rates calibrated to the 2023-25 drive mix (~5.7 plays a drive, ~2.2% of
+        # plays a turnover, ~11% of drives a stall in FG range). The previous constants ended a
+        # drive every three plays and produced a sixth of the touchdowns.
+        if rng.random() < TURNOVER_PER_PLAY:
             return
-        if gain < 3.0 and rng.random() < 0.42:  # stalled
+        if gain < 3.0 and rng.random() < STALL_AFTER_SHORT_GAIN:
             break
 
     if kickers and yardline <= FG_RANGE_YARDLINE:
         kicker = kickers[0]
         kicker.stats["fg_attempts"][sim] += 1
-        distance = yardline + 17.0
+        distance = yardline + KICK_DISTANCE_OFFSET
         if rng.random() < _fg_probability(distance):
             kicker.stats["fg_made"][sim] += 1
             kicker.stats["kicking_points"][sim] += 3
@@ -603,12 +614,16 @@ def joint_probability(
 
     with connect() as con:
         run = con.execute(
-            "SELECT run_id FROM simulation_runs WHERE season = ? AND week = ? "
+            "SELECT run_id, created_at FROM simulation_runs WHERE season = ? AND week = ? "
             "ORDER BY created_at DESC LIMIT 1",
             [season, week],
         ).fetchone()
         if not run:
             return {"error": "no simulation for this week; run `proplab simulate`"}
+        newest = con.execute(
+            "SELECT max(computed_at) FROM projections WHERE season = ? AND week = ?", [season, week]
+        ).fetchone()[0]
+        stale = bool(newest and run[1] and run[1] < newest)
 
         arrays = []
         for gsis, stat, line, side in legs:
@@ -629,6 +644,8 @@ def joint_probability(
         "joint": joint,
         "independent": independent,
         "correlation_multiple": joint / independent if independent > 0 else None,
+        "stale": stale,
+        "warning": "simulation predates the current projections; run `proplab simulate`" if stale else None,
         "legs": [
             {"gsis_id": g, "stat": s, "line": ln, "side": sd, "leg_probability": float(a.mean())}
             for (g, s, ln, sd), a in zip(legs, arrays, strict=True)

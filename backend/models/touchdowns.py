@@ -312,6 +312,32 @@ def load_td_share_models() -> dict[str, TDShareModel]:
     return out
 
 
+def player_usage_features(gsis_id: str, season: int, week: int) -> tuple[float, float, int]:
+    """The goal-line and red-zone shares EXACTLY as the share model was fitted on them.
+
+    The fit uses an unweighted mean over the trailing ten games (min three); the projection was
+    applying a six-game, snap-weighted, decayed mean instead -- a different feature, so the fitted
+    coefficients were being evaluated off-distribution. One helper for both paths.
+
+    Returns ``(gl_carry_share, rz_target_share, games)``.
+    """
+    with connect() as con:
+        row = con.execute(
+            f"""
+            SELECT avg(gl_carry_share), avg(rz_target_share), count(*) FROM (
+                SELECT gl_carry_share, rz_target_share
+                FROM player_game_usage
+                WHERE gsis_id = ? AND ((season < ?) OR (season = ? AND week < ?))
+                ORDER BY season DESC, week DESC LIMIT {TRAILING_GAMES}
+            )
+            """,
+            [gsis_id, season, season, week],
+        ).fetchone()
+    if not row or not row[2]:
+        return 0.0, 0.0, 0
+    return float(row[0] or 0.0), float(row[1] or 0.0), int(row[2])
+
+
 def player_td_history(gsis_id: str, season: int, week: int) -> tuple[float, float, int]:
     """The player's share of his team's rushing and receiving TDs over the trailing window.
 

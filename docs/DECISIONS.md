@@ -327,3 +327,83 @@ The ratios that hurt (QB rushing yards ×1.07, passing yards ×1.05) were fittin
 a structural bias. The command is kept as a diagnostic; the table is empty in production and
 `make calibrate` does not run it. The honest position is that a few percent of level error is
 the model's floor with this data, and the intervals already price it.
+
+---
+
+# Review pass, second half (2026-09-06): 41 confirmed findings
+
+The remaining five modules were reviewed under a 7-agent cap (five reviewers, two batch skeptics).
+41 findings confirmed by execution, 3 refuted, 50 checks verified correct. All 41 fixed.
+
+## D24. The width solver assumed coverage rises with variance; for a skewed NB it falls
+
+`_solve_scale` bisected on p25–p75 coverage and returned the ceiling whenever coverage at the
+ceiling was still below target. For a right-skewed negative binomial, widening at a fixed mean
+pushes p25 to zero and the *median* toward zero, so coverage **falls** with scale. The solver
+returned 5.0 for RB receiving yards and QB rushing yards — the worst scale on the grid — and 2026
+Week 1 shipped both cells with collapsed medians. That was the critical live defect.
+
+Three more problems in the same machinery: the fit replay projected with the *previous* table
+still in force, so every `make calibrate` solved a scale relative to the last one and stored it as
+absolute (yardage cells drifted 1.4–1.6× per run); the 50% inclusive-coverage target is
+unreachable for a correctly calibrated discrete distribution (the endpoints carry 10–40% of the
+mass), so every count cell was driven to the 0.4 floor; and the Poisson branch ignored the
+half-sack unit.
+
+The solver now grid-searches for the scale whose **randomised mid-PIT central mass** is closest
+to 50% — a statistic that is exactly 0.5 under a correct model on any support — never accepts a
+scale worse than 1.0, caps at 2.5, floors Poisson cells at 1.0, and clears the table before the
+fit replay so the solve is absolute.
+
+## D25. QB yards applied the defence's volume effect twice
+
+Attempts already carry `pass_volume_allowed`; multiplying them by the per-*game*
+`pass_yards_allowed` multiplier folded volume in again. Both QB yardage stats now use per-attempt
+metrics (`pass_yards_per_attempt_allowed`, `rush_yards_per_carry_allowed`), the way RB yards
+always did.
+
+## D26. Every RB's catch rate and yards-per-target were the league prior with zero games
+
+`targets` is not an RB *prop*, so it was never written to the adjusted game log — and `_rate`
+divides by it. `StatSpec.projected = False` marks a denominator-only stat: carried in the log,
+never projected or displayed.
+
+## D27. Teammate redistribution, second attempt
+
+The first wiring handed the whole 60% WR2 slice to every ranked receiver. The second split it
+among healthy peers but re-added shares of absentees who never played with them: a player's share
+from a previous team (Pacheco's Kansas City targets, now in Detroit) or an absence that predates
+the healthy players' six-game window (so their shares already reflect it). Absentees now count
+only for games played *for* the team, and only if their last appearance falls inside the team's
+last six games.
+
+## D28. The rest, measured rather than assumed
+
+| Was | Is | Evidence |
+|---|---|---|
+| LB rush factor `rate / 0.43`, unit elasticity | `(rate / league)^0.2`, league from the week's environment | league rate is 0.40; measured elasticity 0.15–0.2; the old factor mis-scaled LBs ±20% and only looked right because its mean offset a 10% baseline over-projection |
+| kicker FGA = 50/50 team model and own trailing FGA | 10/90 | own FGA adds ~nothing held out; the board selects on volume, so the blend ran 11–18% high |
+| LB rank score × own team's implied total | factor pinned to 1.0 | no tackle signal; degraded the ordering out of sample |
+| ranking volume terms unweighted | snap-weighted like the shares | a Week 18 rest game changed RB/WR top-10 membership |
+| unconditional longest-X / kicking points = conditional distribution | mixture with a `(1−p)` mass at 0 | were labelled unconditional and were not |
+| TD features: fit on trailing-10 unweighted, applied on 6-game snap-weighted | one helper, both paths | the fitted coefficients were evaluated off-distribution |
+| position fallback alpha from pooled rows | median of per-player alphas | pooling mixed between-player spread in; 2–7× too high |
+| red-zone target share ÷ RZ pass *attempts* | ÷ RZ *targets* | shares summed to 0.87, gap 4–30% by team |
+| goal-line carries include kneels and 2-pt rushes | excluded | |
+| `pass_rate_shift` identically 0 live, and read the whole future season in a replay | live from the environment base rate; replay filtered to prior weeks | |
+| unknown outdoor wind = 0 mph for FGs | mean outdoor wind (7.9) | every live outdoor kicker got the calm make rate |
+| FG fit coded unknown-wind outdoor tries as 0 mph | excluded | 7% of rows; steepened the slope 22% |
+| sim: a pass with no ranked QB became a run | the pass runs; only the QB's own line needs him ranked | 22 of 32 teams have no ranked QB |
+| sim: drives ended every ~3 plays | turnover 0.035/play, stall 0.22 after a short gain | ~5.7 plays a drive; TD-linked correlations were attenuated |
+| sim: FG distance `yardline + 17` | `+ 18` | nflverse convention |
+| sim draws served with no staleness check | simulate runs after project in every refresh; `joint_probability` flags a stale run | |
+| Monte-Carlo seed from `hash()` | `crc32` of the key | `hash()` is salted per process; stored and recomputed projections differed |
+| wind / FG / distance models fitted on every season inside a replay | scoped to the train seasons | the "no leak" claim was not fully true |
+| calibration table "bias" = median residual | mean bias added alongside | the median residual is positive for a skewed stat even when unbiased |
+| absentee share double-counted across two teams | one entry per player | |
+
+**Not fixed, recorded:** usage shares are neither shrunk nor renormalised to the roster (ranked
+players' shares run 7–11% high held out — a larger modelling change); replay boards cannot see
+historical roster status (needs `rosters_weekly`); kicking points convolves FGM and XPM as
+independent (variance ~13% high); a kicker's own distance mix is ignored (±5pp make-rate spread
+across kickers, refuted as immaterial by the skeptic).

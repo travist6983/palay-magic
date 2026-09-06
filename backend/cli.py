@@ -241,19 +241,20 @@ def calibrate_bias_cmd(
 
 @app.command(name="calibrate-dispersion")
 def calibrate_dispersion_cmd(
-    season: Annotated[int, typer.Option(help="Season to FIT on; use a different one to report")] = 2024,
+    seasons: Annotated[str, typer.Option(help="Comma-separated seasons to FIT on; report on another")] = "2023,2024",
     weeks: Annotated[str, typer.Option()] = "5-18",
 ) -> None:
-    """Fit the p25–p75 width per stat on a training season (§6)."""
+    """Fit the p25–p75 width per stat on the training seasons (§6)."""
     from backend.models.backtest import calibrate_dispersion
 
     lo, hi = (int(x) for x in weeks.split("-", 1)) if "-" in weeks else (int(weeks), int(weeks))
-    frame = calibrate_dispersion(season, list(range(lo, hi + 1)))
+    season_list = [int(x) for x in seasons.split(",") if x.strip()]
+    frame = calibrate_dispersion(season_list, list(range(lo, hi + 1)))
     if frame.is_empty():
         console.print("[yellow]nothing to calibrate[/yellow]")
         return
     table = Table("position", "stat", "scale", "n", "coverage before", "coverage after",
-                  title=f"Dispersion calibration (fitted on {season} weeks {lo}-{hi})")
+                  title=f"Dispersion calibration (fitted on {seasons} weeks {lo}-{hi})")
     for r in frame.to_dicts():
         table.add_row(r["position"], r["stat"], f"{r['scale']:.2f}", str(r["n"]),
                       f"{r['coverage_before']:.1%}", f"{r['coverage_after']:.1%}")

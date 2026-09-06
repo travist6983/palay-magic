@@ -125,7 +125,9 @@ def _score_week(run_id: str, season: int, week: int) -> int:
             family=Family(r["dist_family"]),
             params=params,
             mean=r["mean"],
-            integer_valued=r["dist_family"] != "empirical_max",
+            # Longest-X is integer yards from a bootstrap; marking it continuous made prob_exact
+            # short-circuit to 0 and PIT read F(x) instead of the mid-PIT.
+            integer_valued=True,
         )
         actual = float(r["actual"])
         median = float(r["median"])
@@ -232,17 +234,28 @@ def _refit_on(seasons: list[int]) -> None:
     compute_play_rates(seasons)
     fit_position_dispersion(seasons)
     _position_rate_priors(seasons)
+    project_module.set_weather_seasons(seasons)
 
 
-# Scales are bounded: a cell asking for 10x is telling us the mean is wrong, not the width.
-MIN_SCALE, MAX_SCALE = 0.4, 5.0
+# Scales are bounded. Counts cannot be narrowed below a Poisson, and a cell asking for more than
+# 2.5x is telling us the mean or the shape is wrong, not the width.
+MIN_SCALE, MAX_SCALE = 0.5, 2.5
+SCALE_GRID = np.round(np.concatenate([np.arange(0.5, 1.0, 0.1), np.arange(1.0, 2.51, 0.125)]), 3)
 
 # Below this many scored rows a cell borrows the scale fitted for its stat across all positions.
 MIN_CELL_ROWS = 60
 
 
-def _central_coverage(rows: list[dict[str, Any]], scale: float) -> float:
-    """Share of outcomes inside p25-p75 when the model's variance is multiplied by ``scale``."""
+def _mid_pit_central(rows: list[dict[str, Any]], scale: float) -> float:
+    """Share of randomised (mid) PIT values inside [0.25, 0.75] at a given variance scale.
+
+    This is the statistic the width is solved on, and the choice matters. The obvious target --
+    the share of actuals inside the inclusive p25-p75 interval -- is NOT 50% for a correctly
+    calibrated discrete distribution: the endpoints carry 10-40% of the mass, so the solver drove
+    every count stat to its floor and over-narrowed them 17-57% held out. The mid-PIT
+    ``(F(x-) + F(x)) / 2`` is uniform under a correct model whatever the support, so its central
+    mass is exactly 0.5 when the width is right.
+    """
     from scipy import stats as st
 
     hits = 0
@@ -251,60 +264,101 @@ def _central_coverage(rows: list[dict[str, Any]], scale: float) -> float:
         params = json.loads(r["params"])
         family = r["dist_family"]
         actual = float(r["actual"])
+        unit = float(params.get("unit", 1.0) or 1.0)
 
         if family == "negative_binomial":
             mean = float(params["mean"])
-            var = max(float(params["variance"]) * scale, mean * 1.05)
+            var = max(float(params.get("variance_raw", params["variance"])) * scale, mean * 1.05)
             alpha = (var - mean) / (mean * mean)
             rr = 1.0 / max(alpha, 1e-9)
             pp = rr / (rr + mean)
-            lo, hi = st.nbinom.ppf(0.25, rr, pp), st.nbinom.ppf(0.75, rr, pp)
+            k = actual
+            upper = st.nbinom.cdf(np.floor(k), rr, pp)
+            lower = upper - (st.nbinom.pmf(int(k), rr, pp) if float(k).is_integer() else 0.0)
         elif family == "poisson":
-            mean = float(params["lam"])
-            var = max(mean * scale, mean * 1.001)
-            if var > mean * 1.05:
-                alpha = (var - mean) / (mean * mean) if mean > 0 else 1e-6
+            lam = float(params["lam"]) / unit
+            count = actual / unit
+            var_ratio = max(scale, 1.0)  # a Poisson cannot be narrowed
+            if var_ratio > 1.05:
+                mean = lam
+                var = mean * var_ratio
+                alpha = (var - mean) / (mean * mean)
                 rr = 1.0 / max(alpha, 1e-9)
                 pp = rr / (rr + mean)
-                lo, hi = st.nbinom.ppf(0.25, rr, pp), st.nbinom.ppf(0.75, rr, pp)
+                upper = st.nbinom.cdf(np.floor(count), rr, pp)
+                lower = upper - (st.nbinom.pmf(int(round(count)), rr, pp) if float(count).is_integer() else 0.0)
             else:
-                lo, hi = st.poisson.ppf(0.25, mean), st.poisson.ppf(0.75, mean)
+                upper = st.poisson.cdf(np.floor(count), lam)
+                lower = upper - (st.poisson.pmf(int(round(count)), lam) if float(count).is_integer() else 0.0)
         else:
             continue
 
+        pit = (float(lower) + float(upper)) / 2.0
         n += 1
-        hits += int(lo <= actual <= hi)
+        hits += int(0.25 <= pit <= 0.75)
 
     return hits / n if n else float("nan")
 
 
-def _solve_scale(rows: list[dict[str, Any]], target: float = 0.5) -> tuple[float, float, float]:
-    """Bisect for the variance scale whose p25-p75 covers ``target`` of outcomes.
+def _central_coverage(rows: list[dict[str, Any]], scale: float) -> float:
+    """Share of outcomes inside the inclusive p25-p75 when the NB variance is multiplied by
+    ``scale``. Used for yardage cells, where ties are rare and this is the statistic §6 names."""
+    from scipy import stats as st
 
-    Returns ``(scale, coverage_before, coverage_after)``.
+    hits = 0
+    n = 0
+    for r in rows:
+        if r["dist_family"] != "negative_binomial":
+            continue
+        params = json.loads(r["params"])
+        mean = float(params["mean"])
+        var = max(float(params.get("variance_raw", params["variance"])) * scale, mean * 1.05)
+        alpha = (var - mean) / (mean * mean)
+        rr = 1.0 / max(alpha, 1e-9)
+        pp = rr / (rr + mean)
+        lo, hi = st.nbinom.ppf(0.25, rr, pp), st.nbinom.ppf(0.75, rr, pp)
+        n += 1
+        hits += int(lo <= float(r["actual"]) <= hi)
+    return hits / n if n else float("nan")
+
+
+def _solve_scale(rows: list[dict[str, Any]], target: float = 0.5) -> tuple[float, float, float]:
+    """Grid-search the variance scale whose calibration statistic is closest to ``target``.
+
+    The statistic depends on the family. For yardage (negative binomial, few ties) it is the
+    inclusive p25-p75 coverage §6 names -- held out it calibrates better than the mid-PIT, which
+    over-widened 2025 by nine points when used for everything. For count stats (Poisson, heavy
+    ties) inclusive coverage is not 50% under a correct model, so the mid-PIT central mass is
+    used there.
+
+    No monotonicity is assumed. For a right-skewed negative binomial, widening at a fixed mean
+    pushes p25 to zero and the median toward zero, so central mass FALLS with scale; a bisection
+    that assumed the opposite returned the ceiling for RB receiving yards and QB rushing yards and
+    shipped both with collapsed medians. A scale is only accepted if it is at least as good as 1.0;
+    otherwise the cell keeps 1.0 and the problem is the centre or the shape, not the width.
+
+    Returns ``(scale, central_mass_before, central_mass_after)``.
     """
-    before = _central_coverage(rows, 1.0)
+    families = {r["dist_family"] for r in rows}
+    statistic = _central_coverage if families == {"negative_binomial"} else _mid_pit_central
+
+    before = statistic(rows, 1.0)
     if not np.isfinite(before):
         return 1.0, float("nan"), float("nan")
 
-    lo, hi = MIN_SCALE, MAX_SCALE
-    if _central_coverage(rows, hi) < target:
-        return hi, before, _central_coverage(rows, hi)
-    if _central_coverage(rows, lo) > target:
-        return lo, before, _central_coverage(rows, lo)
-
-    for _ in range(24):
-        mid = (lo + hi) / 2
-        if _central_coverage(rows, mid) < target:
-            lo = mid
-        else:
-            hi = mid
-    scale = (lo + hi) / 2
-    return scale, before, _central_coverage(rows, scale)
+    best_scale, best_gap, best_val = 1.0, abs(before - target), before
+    for scale in SCALE_GRID:
+        val = statistic(rows, float(scale))
+        if not np.isfinite(val):
+            continue
+        gap = abs(val - target)
+        if gap < best_gap - 1e-9:
+            best_scale, best_gap, best_val = float(scale), gap, val
+    return best_scale, before, best_val
 
 
 # Shrinkage on the bias ratio: a cell with n rows gets weight n / (n + BIAS_PRIOR_ROWS) on its
-# own ratio and the rest on 1.0, so a thin cell cannot swing a projection on noise.
+# own ratio and the rest on 1.0. Diagnostic only -- see D23.
 BIAS_PRIOR_ROWS = 60
 BIAS_RATIO_BOUNDS = (0.7, 1.4)
 
@@ -391,7 +445,7 @@ def calibrate_bias(
 
 
 def calibrate_dispersion(
-    season: int = 2024,
+    season: int | list[int] = 2024,
     weeks: list[int] | None = None,
     reuse_run: str | None = None,
 ) -> pl.DataFrame:
@@ -410,25 +464,40 @@ def calibrate_dispersion(
         The fitted scales, with coverage before and after.
     """
     weeks = weeks or list(range(5, 19))
+    seasons = [season] if isinstance(season, int) else list(season)
     if reuse_run:
-        run_id = reuse_run
+        run_ids = [reuse_run]
     else:
-        log.info("replaying %s weeks %s-%s to fit dispersion", season, min(weeks), max(weeks))
-        run_backtest(season=season, weeks=weeks, refit=True, quiet=True)
-        run_id = latest_run()
+        # The fit replay must project at scale 1.0. Leaving the previous table in force solved a
+        # scale RELATIVE to it and stored it as absolute, so every `make calibrate` compounded
+        # the last one and the yardage cells drifted by 1.4-1.6x per run.
+        from backend.models import project as project_module
+
+        with connect() as con:
+            con.execute("DELETE FROM dispersion_calibration")
+        project_module._DISPERSION_SCALE_CACHE = None
+        # More than one fit season is the point: a width solved on a single season's replay
+        # tracked that season's noise (2024 alone ran nine points wide on 2025).
+        run_ids = []
+        for fit_season in seasons:
+            log.info("replaying %s weeks %s-%s at scale 1.0 to fit dispersion", fit_season, min(weeks), max(weeks))
+            run_backtest(season=fit_season, weeks=weeks, refit=True, quiet=True)
+            run_ids.append(latest_run())
 
     with connect() as con:
         df = con.execute(
             "SELECT position, stat, dist_family, params, actual FROM backtest_results "
-            "WHERE run_id = ? AND dist_family IN ('negative_binomial', 'poisson')",
-            [run_id],
+            f"WHERE run_id IN ({','.join('?' * len(run_ids))}) "
+            "AND dist_family IN ('negative_binomial', 'poisson')",
+            run_ids,
         ).pl()
+    season = seasons[-1]  # for the label
 
     if df.is_empty():
         log.warning("no scored rows to calibrate dispersion from")
         return pl.DataFrame()
 
-    label = f"{season} weeks {min(weeks)}-{max(weeks)}"
+    label = f"{'+'.join(str(x) for x in seasons)} weeks {min(weeks)}-{max(weeks)}"
     by_stat: dict[str, tuple[float, float, float, int]] = {}
     for stat in df["stat"].unique():
         rows = df.filter(pl.col("stat") == stat).to_dicts()
@@ -445,6 +514,8 @@ def calibrate_dispersion(
         else:
             # Too thin to fit on its own: borrow the scale fitted for this stat league-wide.
             scale, before, after, n = by_stat.get(stat, (1.0, float("nan"), float("nan"), 0))
+        if all(r["dist_family"] == "poisson" for r in rows) and scale < 1.0:
+            scale = 1.0  # a Poisson cannot be narrowed; anything below 1 was a no-op
         out.append(
             {
                 "position": position, "stat": stat, "scale": float(scale), "n": int(n),
@@ -595,6 +666,7 @@ def calibration_table(run_id: str, positions: list[str] | None = None) -> pl.Dat
                    count(*)                                   AS n,
                    avg(abs_error)                             AS mae,
                    avg(actual - projected_median)             AS bias,
+                   avg(actual - json_extract(params, '$.mean')::DOUBLE) AS mean_bias,
                    avg(CASE WHEN in_interval THEN 1.0 ELSE 0 END) AS coverage,
                    avg((p_over_median - CASE WHEN outcome_over THEN 1.0 ELSE 0 END)
                        * (p_over_median - CASE WHEN outcome_over THEN 1.0 ELSE 0 END)) AS brier,
@@ -640,9 +712,10 @@ def print_calibration(
         return
 
     t = Table(
-        "position", "stat", "n", "MAE", "bias", "p25–p75", "PIT central", "Brier", "over rate",
-        "median proj", "median actual",
-        title="Calibration — target: coverage ≈ 50%, PIT central ≈ 50%, Brier ≈ 0.25, bias ≈ 0",
+        "position", "stat", "n", "MAE", "median resid", "mean bias", "p25–p75", "PIT central",
+        "Brier", "over rate", "median proj", "median actual",
+        title="Calibration — target: PIT central ≈ 50%, coverage ≈ 50%, Brier ≈ 0.25, mean bias ≈ 0 "
+              "(median residual is positive for a right-skewed stat even when unbiased)",
         title_justify="left",
     )
     for r in table.to_dicts():
@@ -653,7 +726,9 @@ def print_calibration(
         cov_text = f"[{colour}]{cov:.1%}[/{colour}]" + (" [dim]†[/dim]" if degenerate else "")
         t.add_row(
             r["position"], r["stat"], str(r["n"]),
-            f"{r['mae']:.2f}", f"{r['bias']:+.2f}", cov_text,
+            f"{r['mae']:.2f}", f"{r['bias']:+.2f}",
+            f"{r['mean_bias']:+.2f}" if r.get("mean_bias") is not None else "—",
+            cov_text,
             f"[{pit_colour}]{pit:.1%}[/{pit_colour}]",
             f"{r['brier']:.3f}", f"{r['over_rate']:.1%}",
             f"{r['median_projected']:.1f}", f"{r['median_actual']:.1f}",

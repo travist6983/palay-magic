@@ -108,9 +108,14 @@ def build_player_game_stats(seasons: list[int] | None = None) -> int:
         WITH plays AS (
             SELECT season, week, game_id, posteam AS team, defteam AS opponent,
                    passer_player_id, receiver_player_id, rusher_player_id,
-                   complete_pass, rush_attempt, yards_gained
+                   complete_pass, rush_attempt, yards_gained,
+                   -- Yards after a lateral belong to the lateral receiver, not the original one.
+                   CASE WHEN lateral_receiver_player_id IS NOT NULL
+                        THEN coalesce(air_yards, 0) + coalesce(yards_after_catch, 0)
+                        ELSE yards_gained END AS receiver_yards
             FROM raw_pbp
             WHERE season IN ({season_list}) AND season_type = 'REG'
+              AND coalesce(two_point_attempt, 0) = 0 AND coalesce(play_type, '') <> 'no_play'
         )
         SELECT passer_player_id AS gsis_id, season, week, game_id, team, opponent,
                'longest_completion' AS stat, max(yards_gained)::DOUBLE AS value
@@ -118,7 +123,7 @@ def build_player_game_stats(seasons: list[int] | None = None) -> int:
         GROUP BY 1,2,3,4,5,6
         UNION ALL
         SELECT receiver_player_id, season, week, game_id, team, opponent,
-               'longest_reception', max(yards_gained)::DOUBLE
+               'longest_reception', max(receiver_yards)::DOUBLE
         FROM plays WHERE complete_pass = 1 AND receiver_player_id IS NOT NULL
         GROUP BY 1,2,3,4,5,6
         UNION ALL
@@ -232,14 +237,20 @@ def build_player_game_usage(seasons: list[int] | None = None) -> int:
     rz AS (
         SELECT season, week, game_id, posteam AS team,
                receiver_player_id AS gsis_id,
-               sum(CASE WHEN yardline_100 <= 20 AND pass_attempt = 1 THEN 1 ELSE 0 END) AS rz_targets
+               sum(CASE WHEN yardline_100 <= 20 AND pass_attempt = 1
+                         AND coalesce(two_point_attempt, 0) = 0 AND coalesce(play_type, '') <> 'no_play'
+                        THEN 1 ELSE 0 END) AS rz_targets
         FROM raw_pbp
         WHERE season IN ({season_list}) AND season_type = 'REG' AND receiver_player_id IS NOT NULL
         GROUP BY 1, 2, 3, 4, 5
     ),
+    -- Same population as the numerator: TARGETS (a receiver on the play), not attempts. Sacks,
+    -- throwaways and two-point passes in the denominator made shares sum to 0.87.
     rz_team AS (
         SELECT season, week, game_id, posteam AS team,
-               sum(CASE WHEN yardline_100 <= 20 AND pass_attempt = 1 THEN 1 ELSE 0 END) AS team_rz_targets
+               sum(CASE WHEN yardline_100 <= 20 AND pass_attempt = 1 AND receiver_player_id IS NOT NULL
+                         AND coalesce(two_point_attempt, 0) = 0 AND coalesce(play_type, '') <> 'no_play'
+                        THEN 1 ELSE 0 END) AS team_rz_targets
         FROM raw_pbp
         WHERE season IN ({season_list}) AND season_type = 'REG'
         GROUP BY 1, 2, 3, 4
@@ -251,6 +262,8 @@ def build_player_game_usage(seasons: list[int] | None = None) -> int:
         FROM raw_pbp
         WHERE season IN ({season_list}) AND season_type = 'REG'
           AND rush_attempt = 1 AND rusher_player_id IS NOT NULL
+          AND coalesce(two_point_attempt, 0) = 0 AND coalesce(qb_kneel, 0) = 0
+          AND coalesce(play_type, '') <> 'no_play'
         GROUP BY 1, 2, 3, 4, 5
     ),
     carries_rz_team AS (
@@ -258,6 +271,8 @@ def build_player_game_usage(seasons: list[int] | None = None) -> int:
                sum(CASE WHEN yardline_100 <= 5 THEN 1 ELSE 0 END) AS team_gl_carries
         FROM raw_pbp
         WHERE season IN ({season_list}) AND season_type = 'REG' AND rush_attempt = 1
+          AND coalesce(two_point_attempt, 0) = 0 AND coalesce(qb_kneel, 0) = 0
+          AND coalesce(play_type, '') <> 'no_play'
         GROUP BY 1, 2, 3, 4
     ),
     team_plays AS (

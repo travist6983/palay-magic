@@ -180,17 +180,24 @@ independent product.
 
 ## Review pass (2026-09-06)
 
-A review of the equations found 19 defects; all fixed (D16–D22). A held-out mean-bias
-correction was then tried and rejected because it failed validation (D23).
+A full review of the equations in two halves. First half: five module reviewers, 19 defects,
+all fixed (D16–D22); a held-out mean-bias correction was then tried and rejected (D23). Second
+half under a 7-agent cap: 41 confirmed findings, 3 refuted, all 41 fixed (D24–D28) — including a
+critical live one, a width solver that assumed coverage rises with variance and shipped two cells
+with collapsed medians.
 
-Held-out 2025 weeks 5–18 after the fixes: **p25–p75 coverage 59.0%, PIT central mass 51.6%**
-(gate 40–60%). Anytime-TD calibration, the most-bet market: RB bias +11.4pp → −1.1pp, QB rush
-+14.6 → +8.4, TE −13.3 → −12.4, WR +0.5 → +4.8. The honest matchup numbers are now much smaller
-(best defensive signal 5.9% MSE reduction; WR/RB yards-per-target allowed pinned to neutral as
-no-signal).
+**Held-out 2025, weeks 5–18, final:** p25–p75 coverage **60.4%**, PIT central mass **53.3%**
+(gate 40–60%; widths fitted on 2023+2024). Per stat the yardage cells sit where they should —
+passing 53%, receiving 52%, rush+rec 55%, rushing 44% — and the aggregate is pulled up by the
+count stats, which cannot reach 50% inclusive coverage under a correct model.
 
-Residual level errors of a few percent remain (rushing yards +2.2, passing yards −7.1, targets
-+0.8 on 2025) and are not stable enough across seasons to correct — see D23.
+Anytime TD, the most-bet market, predicted vs realised: RB 54.8% vs 56.8%, WR 40.3% vs 36.6%,
+QB rush 23.0% vs 14.1%, TE 27.3% vs 40.8%. RB and WR are calibrated; QB rush over-predicts and
+TE under-predicts at the top of the usage range, and neither closed with the data available.
+
+Yardage MAE improved (rushing 24.1 → 22.6, receiving 24.7 → 23.8); passing worsened (54.7 → 57.7)
+alongside a −9.4-yard level bias that survived a starter-calibre prior. Level errors of this size
+are not stable across seasons (D23), so they are stated rather than corrected.
 
 ## Where the model is weak
 

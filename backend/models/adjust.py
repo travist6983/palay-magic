@@ -77,6 +77,8 @@ METRICS: tuple[Metric, ...] = (
     Metric("pass_volume_allowed", DEFENSE, "QB", "Pass attempts allowed / game"),
     Metric("completion_rate_allowed", DEFENSE, "QB", "Completion % allowed"),
     Metric("pass_yards_allowed", DEFENSE, "QB", "Passing yards allowed / game"),
+    Metric("pass_yards_per_attempt_allowed", DEFENSE, "QB", "Yards per pass attempt allowed"),
+    Metric("rush_yards_per_carry_allowed", DEFENSE, "ALL", "Yards per carry allowed"),
     Metric("pass_td_rate_allowed", DEFENSE, "QB", "Passing TDs allowed / game"),
     Metric("int_rate_generated", DEFENSE, "QB", "INTs forced / attempt", higher_is_softer=False),
     Metric("explosive_pass_allowed", DEFENSE, "ALL", "20+ yard completions / completion"),
@@ -126,6 +128,13 @@ _BOX_METRICS: tuple[tuple[str, str, str], ...] = (
      "sum(CASE WHEN position='QB' THEN completions END)",
      "sum(CASE WHEN position='QB' THEN attempts END)"),
     ("pass_yards_allowed", "sum(CASE WHEN position='QB' THEN passing_yards END)", "1"),
+    # Per-attempt: a QB's yards projection is attempts x yards-per-attempt, and multiplying the
+    # attempts (already scaled by pass_volume_allowed) by the per-GAME yards multiplier applied the
+    # defence's volume effect twice.
+    ("pass_yards_per_attempt_allowed",
+     "sum(CASE WHEN position='QB' THEN passing_yards END)",
+     "sum(CASE WHEN position='QB' THEN attempts END)"),
+    ("rush_yards_per_carry_allowed", "sum(rushing_yards)", "sum(carries)"),
     ("pass_td_rate_allowed", "sum(CASE WHEN position='QB' THEN passing_tds END)", "1"),
     ("int_rate_generated",
      "sum(CASE WHEN position='QB' THEN passing_interceptions END)",
@@ -1010,6 +1019,7 @@ def build_adjusted_game_logs(
     lookback = max(settings.recency_window, settings.efficiency_window) if lookback is None else lookback
 
     # (position, stat) -> the defensive metric that adjusts it, from the canonical registry.
+    # Denominator-only stats (an RB's targets) are included: the rate helpers divide by them.
     mapping = pl.DataFrame(
         [
             {"position": pos, "stat": spec.key, "metric": spec.defense_metric}

@@ -118,6 +118,7 @@ def _weighted(
     value_col: str,
     weight_col: str | None = None,
     group: str = "gsis_id",
+    target_season: int | None = None,
 ) -> pl.DataFrame:
     """Recency-weighted mean of ``value_col``, optionally precision-weighted by ``weight_col``.
 
@@ -127,7 +128,10 @@ def _weighted(
     """
     settings = get_settings()
     decay, discount = settings.recency_decay, settings.prior_season_discount
-    target_season = df["season"].max()
+    # Inferring the target season from the data reads 0 prior-season games at 2026 Week 1, when
+    # every game is prior-season; the caller passes the build season instead.
+    if target_season is None:
+        target_season = df["season"].max()
 
     work = df.with_columns(
         (pl.lit(decay) ** pl.col("games_ago")).alias("_w_recency"),
@@ -291,6 +295,7 @@ def _continuity(season: int, week: int) -> dict[str, dict]:
             ) WHERE coach IS NOT NULL GROUP BY 1, 2
             """
         ).pl()
+        # Strictly before the target week, so a replay cannot read the rest of its own season.
         pass_rates = con.execute(
             """
             SELECT season, posteam AS team,
@@ -298,8 +303,16 @@ def _continuity(season: int, week: int) -> dict[str, dict]:
                      / nullif(sum(CASE WHEN qb_dropback = 1 OR rush_attempt = 1 THEN 1 ELSE 0 END), 0)
                      AS pass_rate
             FROM raw_pbp WHERE season_type = 'REG' AND posteam IS NOT NULL
+              AND ((season < ?) OR (season = ? AND week < ?))
             GROUP BY 1, 2
-            """
+            """,
+            [season, season, week],
+        ).pl()
+        # For the live week nothing has been played yet, so "this season's pass rate" is the
+        # environment model's pre-script base rate for the target week.
+        live_rates = con.execute(
+            "SELECT team, base_pass_rate FROM team_environment WHERE season = ? AND week = ?",
+            [season, week],
         ).pl()
 
     out: dict[str, dict] = {}
@@ -307,6 +320,8 @@ def _continuity(season: int, week: int) -> dict[str, dict]:
     coach_now = {r["team"]: r["coach"] for r in coaches.filter(pl.col("season") == season).to_dicts()}
     coach_prev = {r["team"]: r["coach"] for r in coaches.filter(pl.col("season") == prior).to_dicts()}
     pr_now = {r["team"]: r["pass_rate"] for r in pass_rates.filter(pl.col("season") == season).to_dicts()}
+    if not pr_now:
+        pr_now = {r["team"]: r["base_pass_rate"] for r in live_rates.to_dicts() if r["base_pass_rate"] is not None}
     pr_prev = {r["team"]: r["pass_rate"] for r in pass_rates.filter(pl.col("season") == prior).to_dicts()}
 
     for team in set(coach_prev) | set(coach_now) | set(pr_prev):
@@ -339,11 +354,6 @@ def _score_frame(season: int, week: int, position: Position, window: int) -> pl.
     # player_game_stats is league-wide, so every stat frame below must be restricted to the
     # players who actually play this position. Without this the TE board fills up with wide
     # receivers, who out-target every tight end in the league.
-    eligible = set(usage["gsis_id"].to_list())
-
-    def _restrict(frame: pl.DataFrame) -> pl.DataFrame:
-        return frame.filter(pl.col("gsis_id").is_in(list(eligible)))
-
     # Snap weight: how much evidence each game carries. Falls back to 1 when snap data is missing
     # so a player is never dropped for want of a PFR row.
     off = pl.col("offense_snaps").fill_null(0).cast(pl.Float64)
@@ -352,13 +362,24 @@ def _score_frame(season: int, week: int, position: Position, window: int) -> pl.
         pl.when((off + dfn) > 0).then(off + dfn).otherwise(1.0).alias("snap_weight")
     )
 
+    eligible = set(usage["gsis_id"].to_list())
+    snap_weights = usage.select("gsis_id", "season", "week", "snap_weight")
+
+    def _restrict(frame: pl.DataFrame) -> pl.DataFrame:
+        # Volume terms are snap-weighted like the share terms: a Week 18 rest game with one target
+        # is not evidence of a one-target role. Unweighted, it changed RB/WR top-10 membership.
+        return frame.filter(pl.col("gsis_id").is_in(list(eligible))).join(
+            snap_weights, on=["gsis_id", "season", "week"], how="left"
+        ).with_columns(pl.col("snap_weight").fill_null(1.0))
+
+
     match position:
         case Position.QB:
             stats = _restrict(_recent_stats(season, week, window, ("pass_attempts", "rush_attempts")))
             attempts = stats.filter(pl.col("stat") == "pass_attempts")
             rushes = stats.filter(pl.col("stat") == "rush_attempts")
-            base = _weighted(attempts, "value").rename({"value": "pass_attempts"})
-            rush = _weighted(rushes, "value").rename({"value": "rush_attempts"}).select(
+            base = _weighted(attempts, "value", "snap_weight", target_season=season).rename({"value": "pass_attempts"})
+            rush = _weighted(rushes, "value", "snap_weight", target_season=season).rename({"value": "rush_attempts"}).select(
                 "gsis_id", "rush_attempts"
             )
             frame = base.join(rush, on="gsis_id", how="left").with_columns(
@@ -374,13 +395,13 @@ def _score_frame(season: int, week: int, position: Position, window: int) -> pl.
 
         case Position.RB:
             stats = _restrict(_recent_stats(season, week, window, ("rush_attempts", "targets")))
-            carries = _weighted(stats.filter(pl.col("stat") == "rush_attempts"), "value").rename(
+            carries = _weighted(stats.filter(pl.col("stat") == "rush_attempts"), "value", "snap_weight", target_season=season).rename(
                 {"value": "carries"}
             )
-            tgts = _weighted(stats.filter(pl.col("stat") == "targets"), "value").rename(
+            tgts = _weighted(stats.filter(pl.col("stat") == "targets"), "value", "snap_weight", target_season=season).rename(
                 {"value": "targets"}
             ).select("gsis_id", "targets")
-            gl = _weighted(usage, "gl_carry_share", "snap_weight").select(
+            gl = _weighted(usage, "gl_carry_share", "snap_weight", target_season=season).select(
                 "gsis_id", "gl_carry_share"
             )
             frame = (
@@ -399,9 +420,9 @@ def _score_frame(season: int, week: int, position: Position, window: int) -> pl.
 
         case Position.WR | Position.TE:
             stats = _restrict(_recent_stats(season, week, window, ("targets",)))
-            tgts = _weighted(stats, "value").rename({"value": "targets"})
-            part = _weighted(usage, "offense_pct", "snap_weight").select("gsis_id", "offense_pct")
-            rz = _weighted(usage, "rz_target_share", "snap_weight").select(
+            tgts = _weighted(stats, "value", "snap_weight", target_season=season).rename({"value": "targets"})
+            part = _weighted(usage, "offense_pct", "snap_weight", target_season=season).select("gsis_id", "offense_pct")
+            rz = _weighted(usage, "rz_target_share", "snap_weight", target_season=season).select(
                 "gsis_id", "rz_target_share"
             )
             frame = (
@@ -424,10 +445,10 @@ def _score_frame(season: int, week: int, position: Position, window: int) -> pl.
 
         case Position.K:
             stats = _restrict(_recent_stats(season, week, window, ("fg_attempts", "xp_made")))
-            fga = _weighted(stats.filter(pl.col("stat") == "fg_attempts"), "value").rename(
+            fga = _weighted(stats.filter(pl.col("stat") == "fg_attempts"), "value", target_season=season).rename(
                 {"value": "fg_attempts"}
             )
-            xp = _weighted(stats.filter(pl.col("stat") == "xp_made"), "value").rename(
+            xp = _weighted(stats.filter(pl.col("stat") == "xp_made"), "value", target_season=season).rename(
                 {"value": "xp_made"}
             ).select("gsis_id", "xp_made")
             frame = (
@@ -444,14 +465,14 @@ def _score_frame(season: int, week: int, position: Position, window: int) -> pl.
             )
 
         case Position.LB:
-            snap = _weighted(usage, "defense_pct", "snap_weight").select("gsis_id", "defense_pct")
-            tackle = _weighted(usage, "tackle_share", "snap_weight").select(
+            snap = _weighted(usage, "defense_pct", "snap_weight", target_season=season).select("gsis_id", "defense_pct")
+            tackle = _weighted(usage, "tackle_share", "snap_weight", target_season=season).select(
                 "gsis_id", "tackle_share"
             )
             frame = (
                 snap.join(tackle, on="gsis_id", how="left")
                 .join(
-                    _weighted(usage, "defense_pct", "snap_weight").select(
+                    _weighted(usage, "defense_pct", "snap_weight", target_season=season).select(
                         "gsis_id", "n_games", "n_prior_season"
                     ),
                     on="gsis_id",
@@ -580,6 +601,10 @@ def build_rankings(season: int, week: int, window: int | None = None) -> int:
             # §4 applies the team's scoring environment to every position's usage score. K is the
             # one where implied total is additive rather than multiplicative -- a kicker's volume
             # comes from the offence stalling, not from how many plays he is on the field for.
+            # LB is exempt: a linebacker's tackles scale with the OPPONENT's offence, and his own
+            # team's implied total carried no signal held out (it degraded the ordering).
+            if position is Position.LB:
+                implied_factor = 1.0
             score = base + implied_factor if position is Position.K else base * implied_factor
 
             n_games = int(r.get("n_games") or 0)

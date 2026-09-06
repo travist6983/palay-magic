@@ -31,6 +31,10 @@ INDOOR_ROOFS = frozenset({"dome", "closed"})
 # Beyond this the sample is too thin to trust and the fit is extrapolating.
 MAX_MODELLED_WIND = 25.0
 
+MEAN_OUTDOOR_WIND = 7.9
+"""Used when an outdoor game has no forecast yet. Pricing "unknown" as 0 mph gave every outdoor
+kicker in a live week the calm make rate."""
+
 
 @dataclass(frozen=True)
 class WindEffect:
@@ -67,8 +71,13 @@ class FieldGoalModel:
     n_attempts: int
 
     def make_probability(self, distance: float, wind_mph: float | None, indoor: bool) -> float:
-        """Probability this attempt is good."""
-        wind = 0.0 if indoor or wind_mph is None else float(np.clip(wind_mph, 0.0, MAX_MODELLED_WIND))
+        """Probability this attempt is good. Unknown outdoor wind is priced as average, not calm."""
+        if indoor:
+            wind = 0.0
+        elif wind_mph is None:
+            wind = MEAN_OUTDOOR_WIND
+        else:
+            wind = float(np.clip(wind_mph, 0.0, MAX_MODELLED_WIND))
         z = (
             self.intercept
             + self.per_yard * float(distance)
@@ -149,6 +158,9 @@ def fit_field_goal_model(seasons: list[int] | None = None) -> FieldGoalModel:
             WHERE p.season_type = 'REG' AND p.field_goal_attempt = 1
               AND p.kick_distance IS NOT NULL AND p.field_goal_result IS NOT NULL
               AND p.season IN ({season_list})
+              -- An outdoor try with no recorded wind is not a 0-mph try; 7% of rows coded that
+              -- way steepened the wind slope by 22%. Indoor rows keep wind = 0 by definition.
+              AND (lower(coalesce(s.roof, '')) IN ('dome', 'closed') OR s.wind IS NOT NULL)
             """
         ).pl()
 

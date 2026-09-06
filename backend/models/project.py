@@ -28,6 +28,7 @@ Everything is reported twice: conditional on the player being active, and uncond
 from __future__ import annotations
 
 import json
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,6 +66,7 @@ from backend.models.touchdowns import (
     TDShareModel,
     load_td_share_models,
     player_td_history,
+    player_usage_features,
 )
 from backend.models.weather import (
     FieldGoalModel,
@@ -85,6 +87,11 @@ _DISPERSION_SCALE_CACHE: dict[tuple[str, str], float] | None = None
 
 # Extra points MADE per offensive touchdown, measured (0.905 over 2023-25). The old constant
 # 0.94 was ATTEMPTS per touchdown and omitted the make rate, so xp_made ran 3.9% high.
+LB_RUSH_ELASTICITY = 0.2
+KICKER_OWN_WEIGHT = 0.1
+"""Measured elasticity of an every-down LB's tackles to the opponent's rush rate (~0.15-0.2)."""
+
+
 def _xp_per_td(constants: dict[str, float]) -> float:
     return float(constants.get("xp_made_per_td", 0.905))
 
@@ -182,6 +189,28 @@ def variance_at(mean: float, alpha: float, scale: float = 1.0) -> float:
 
 
 _BIAS_CACHE: dict[tuple[str, str], float] | None = None
+_WEATHER_SEASONS: list[int] | None = None
+_WEATHER_CACHE: dict[str, object] = {}
+
+
+def set_weather_seasons(seasons: list[int]) -> None:
+    """Scope the wind, field-goal and attempt-distance fits to these seasons (a replay's train set).
+
+    build_context has no notion of a cutoff and fitted all three on every season in the cache --
+    including the test season's own kicks -- so the backtest's "no leak" claim was not fully true.
+    """
+    global _WEATHER_SEASONS
+    _WEATHER_SEASONS = list(seasons)
+    _WEATHER_CACHE.clear()
+
+
+def _weather_models() -> tuple[WindEffect, FieldGoalModel, tuple[np.ndarray, np.ndarray]]:
+    if not _WEATHER_CACHE:
+        seasons = _WEATHER_SEASONS
+        _WEATHER_CACHE["wind"] = fit_wind_effect(seasons)
+        _WEATHER_CACHE["fg"] = fit_field_goal_model(seasons)
+        _WEATHER_CACHE["dist"] = attempt_distance_distribution(seasons)
+    return _WEATHER_CACHE["wind"], _WEATHER_CACHE["fg"], _WEATHER_CACHE["dist"]  # type: ignore[return-value]
 
 
 def bias_ratio(position: str, stat: str) -> float:
@@ -234,20 +263,28 @@ def fit_position_dispersion(seasons: list[int] | None = None) -> dict[tuple[str,
 
     seasons = seasons or list(get_settings().seasons)
     season_list = ",".join(str(s) for s in seasons)
+    # WITHIN-player over-dispersion: the median of each player's own alpha over players with a
+    # dozen games. Pooling every row and taking one variance mixed between-player spread into the
+    # estimate and overstated within-player dispersion 2-7x.
     with connect() as con:
         df = con.execute(
             f"""
-            SELECT position, stat, avg(value) AS mean, var_samp(value) AS variance, count(*) AS n
-            FROM player_game_stats
-            WHERE season IN ({season_list}) AND position IN ('QB','RB','WR','TE','K','LB')
-            GROUP BY 1, 2 HAVING count(*) >= 200
+            WITH per_player AS (
+                SELECT position, stat, gsis_id,
+                       avg(value) AS mean, var_samp(value) AS variance, count(*) AS n
+                FROM player_game_stats
+                WHERE season IN ({season_list}) AND position IN ('QB','RB','WR','TE','K','LB')
+                GROUP BY 1, 2, 3 HAVING count(*) >= 12 AND avg(value) > 0
+            )
+            SELECT position, stat,
+                   median(greatest((variance - mean) / (mean * mean), 0.02)) AS alpha,
+                   count(*) AS n_players
+            FROM per_player
+            GROUP BY 1, 2 HAVING count(*) >= 8
             """
         ).pl()
 
-    _DISPERSION_CACHE = {
-        (r["position"], r["stat"]): alpha_from_moments(r["mean"] or 0.0, r["variance"] or 0.0)
-        for r in df.to_dicts()
-    }
+    _DISPERSION_CACHE = {(r["position"], r["stat"]): float(r["alpha"]) for r in df.to_dicts()}
     log.info("position dispersion fitted for %d (position, stat) pairs", len(_DISPERSION_CACHE))
     return _DISPERSION_CACHE
 
@@ -297,30 +334,60 @@ def _absent_by_team(season: int, week: int) -> dict[str, list[dict]]:
     with connect() as con:
         rows = con.execute(
             f"""
-            SELECT gsis_id, team, position,
-                   avg(target_share) AS target_share, avg(carry_share) AS carry_share
+            SELECT u.gsis_id, cur.team, any_value(u.position) AS position,
+                   avg(u.target_share) AS target_share, avg(u.carry_share) AS carry_share
             FROM (
                 SELECT *, row_number() OVER (PARTITION BY gsis_id ORDER BY season DESC, week DESC) AS rn
                 FROM player_game_usage
                 WHERE gsis_id IN ({",".join("?" * len(excluded))})
                   AND ((season < ?) OR (season = ? AND week < ?))
-            ) WHERE rn <= 6 GROUP BY 1, 2, 3
+            ) u
+            JOIN (SELECT gsis_id, any_value(team) AS team FROM raw_rosters WHERE season = ? GROUP BY 1) cur
+              USING (gsis_id)
+            -- Only games played FOR the team he is absent from: a share earned elsewhere (Pacheco's
+            -- Kansas City targets, now in Detroit) is not a share Detroit's receivers are losing.
+            WHERE u.rn <= 6 AND u.team = cur.team
+            GROUP BY 1, 2
             """,
-            [*excluded, season, season, week],
+            [*excluded, season, season, week, season],
         ).fetchall()
-        current = {
-            g: t
-            for g, t in con.execute(
-                "SELECT gsis_id, team FROM raw_rosters WHERE season = ? AND gsis_id IS NOT NULL",
-                [season],
+
+    with connect() as con:
+        # The team's sixth-most-recent game key; an absentee whose last appearance predates it was
+        # already missing from the healthy players' windows, and his share is already in theirs.
+        cutoff = {
+            t: k
+            for t, k in con.execute(
+                """
+                SELECT team, min(k) FROM (
+                    SELECT team, season * 100 + week AS k,
+                           row_number() OVER (PARTITION BY team ORDER BY season DESC, week DESC) AS rn
+                    FROM (SELECT DISTINCT team, season, week FROM player_game_usage
+                          WHERE (season < ?) OR (season = ? AND week < ?))
+                ) WHERE rn <= 6 GROUP BY 1
+                """,
+                [season, season, week],
+            ).fetchall()
+        }
+        last_seen = {
+            g: k
+            for g, k in con.execute(
+                f"""
+                SELECT gsis_id, max(season * 100 + week) FROM player_game_usage
+                WHERE gsis_id IN ({",".join("?" * len(excluded))})
+                  AND ((season < ?) OR (season = ? AND week < ?))
+                GROUP BY 1
+                """,
+                [*excluded, season, season, week],
             ).fetchall()
         }
 
     out: dict[str, list[dict]] = {}
     for gsis, team, position, tgt, carry in rows:
-        team = current.get(gsis, team)
         if not team or not ((tgt or 0) > 0.03 or (carry or 0) > 0.05):
             continue
+        if last_seen.get(gsis, 0) < cutoff.get(team, 0):
+            continue  # absent before the window; already reflected in teammates' shares
         out.setdefault(team, []).append(
             {"gsis_id": gsis, "position": position, "target_share": float(tgt or 0.0),
              "carry_share": float(carry or 0.0)}
@@ -378,9 +445,9 @@ def build_context(season: int, week: int) -> ProjectionContext:
         environment=environment,
         multipliers=multiplier_lookup(season, week),
         weather=kicking_context(season, week),
-        wind_effect=fit_wind_effect(),
-        fg_model=fit_field_goal_model(),
-        fg_distances=attempt_distance_distribution(),
+        wind_effect=_weather_models()[0],
+        fg_model=_weather_models()[1],
+        fg_distances=_weather_models()[2],
         dispersion=fit_position_dispersion(),
         league_implied=league_implied,
         constants=load_constants(),
@@ -536,19 +603,27 @@ def _position_rate_priors(seasons: list[int] | None = None) -> dict[tuple[str, s
         ("solo_tackles", "tackles_assists"),
     ]
     out: dict[tuple[str, str, str], float] = {}
+    # Starter-calibre rows only: the prior a rate is shrunk toward should describe the population
+    # being projected. Pooling every QB game put the yards-per-attempt prior at 7.06 (backups
+    # included) against ~7.3 for starters, and pulled every starter's projection down ~4%.
+    floors = {"pass_attempts": 15, "rush_attempts": 8, "targets": 4, "tackles_assists": 4}
     with connect() as con:
         for num, den in pairs:
             rows = con.execute(
                 f"""
-                SELECT position,
-                       sum(CASE WHEN stat = ? THEN value END)
-                         / nullif(sum(CASE WHEN stat = ? THEN value END), 0) AS rate
-                FROM player_game_stats
-                WHERE season IN ({season_list}) AND stat IN (?, ?)
-                  AND position IN ('QB','RB','WR','TE','K','LB')
-                GROUP BY 1
+                WITH g AS (
+                    SELECT gsis_id, season, week, position,
+                           max(CASE WHEN stat = ? THEN value END) AS num,
+                           max(CASE WHEN stat = ? THEN value END) AS den
+                    FROM player_game_stats
+                    WHERE season IN ({season_list}) AND stat IN (?, ?)
+                      AND position IN ('QB','RB','WR','TE','K','LB')
+                    GROUP BY 1, 2, 3, 4
+                )
+                SELECT position, sum(num) / nullif(sum(den), 0) AS rate
+                FROM g WHERE den >= ? GROUP BY 1
                 """,
-                [num, den, num, den],
+                [num, den, num, den, floors.get(den, 1)],
             ).fetchall()
             for position, rate in rows:
                 if rate is not None:
@@ -753,7 +828,10 @@ def _scaled_poisson(position: str, stat: str, lam: float, steps: list[MathStep])
     negative binomial; a scale below 1 cannot narrow a Poisson and is a no-op."""
     lam = _apply_bias(position, stat, lam, steps)
     scale = dispersion_scale(position, stat)
-    if abs(scale - 1.0) < 1e-6:
+    if scale <= 1.0 + 1e-6:
+        if scale < 1.0 - 1e-6:
+            steps.append(MathStep("5.6 dispersion", "calibrated width scale (no-op)", scale,
+                                  "a Poisson cannot be narrowed; width kept at 1.0"))
         return fit_poisson(lam)
     steps.append(MathStep("5.6 dispersion", "calibrated width scale", scale,
                           "fitted on a held-out season"))
@@ -778,8 +856,8 @@ def _td_lambda(
     pass_share = _passing_td_share(proj.team, ctx, 0.0)
     team_rec = team_tds * pass_share
     team_rush = team_tds * (1.0 - pass_share)
-    gl_share, _ = _usage_baseline(usage, "gl_carry_share")
-    rz_share, _ = _usage_baseline(usage, "rz_target_share")
+    # The features exactly as the share model was fitted on them (trailing-10 unweighted mean).
+    gl_share, rz_share, _n_feat = player_usage_features(proj.gsis_id, ctx.season, ctx.week)
     h_rush, h_rec, n_hist = player_td_history(proj.gsis_id, ctx.season, ctx.week)
     opp = proj.opponent
     td_mult = _mult(ctx, opp, "rz_td_rate_allowed")
@@ -924,7 +1002,8 @@ def _longest_projection(
         yards_scale=max(fallback_yards * 1.5, 5.0),
         explosive_rate=0.1,
         n_sims=settings.longest_sims,
-        seed=abs(hash((stat, gsis_id, ctx.season, ctx.week))) % (2**31),
+        # hash() is salted per process; a stored projection must be reproducible across runs.
+        seed=zlib.crc32(f"{stat}|{gsis_id}|{ctx.season}|{ctx.week}".encode()) & 0x7FFFFFFF,
     )
     steps.append(
         MathStep("5.6 longest", "P(no qualifying play)", dist.params["p_zero"],
@@ -1087,13 +1166,15 @@ def _project_qb(proj, history, usage, env, ctx, wind_mult) -> None:
 
     ypa, n = _rate(history, "passing_yards", "pass_attempts", ctx.season, pos)
     ypa = ypa if ypa > 0 else 7.0
-    yds_mult = _mult(ctx, opp, "pass_yards_allowed")
+    # Per-ATTEMPT multiplier: attempts already carry pass_volume_allowed, and the per-game yards
+    # multiplier folds volume in again.
+    yds_mult = _mult(ctx, opp, "pass_yards_per_attempt_allowed")
     passing_yards = attempts * ypa * yds_mult * wind_mult
     proj.conditional["passing_yards"] = _yardage_projection(
         "passing_yards", pos, passing_yards, history, ctx,
         [*steps,
          MathStep("5.5 efficiency", "yards per attempt (opponent-adjusted)", ypa, f"{n} games"),
-         MathStep("5.2 opponent", "pass yards allowed multiplier", yds_mult, opp),
+         MathStep("5.2 opponent", "yards per attempt allowed multiplier", yds_mult, opp),
          MathStep("5.5 efficiency", "wind multiplier", wind_mult,
                   f"{proj.context['wind']} mph" if proj.context["wind"] is not None else "dome/unknown"),
          MathStep("5.5 efficiency", "projected passing yards", passing_yards)],
@@ -1143,12 +1224,12 @@ def _project_qb(proj, history, usage, env, ctx, wind_mult) -> None:
 
     ypc, n = _rate(history, "rushing_yards", "rush_attempts", ctx.season, pos)
     ypc = ypc if ypc > 0 else 4.5
-    ry_mult = _mult(ctx, opp, "rush_yards_allowed")
+    ry_mult = _mult(ctx, opp, "rush_yards_per_carry_allowed")
     rushing_yards = rush_attempts * ypc * ry_mult
     proj.conditional["rushing_yards"] = _yardage_projection(
         "rushing_yards", pos, rushing_yards, history, ctx,
         [MathStep("5.5 efficiency", "yards per carry (opponent-adjusted)", ypc, f"{n} games"),
-         MathStep("5.2 opponent", "rush yards allowed multiplier", ry_mult, opp),
+         MathStep("5.2 opponent", "yards per carry allowed multiplier", ry_mult, opp),
          MathStep("5.5 efficiency", "projected rushing yards", rushing_yards)],
         proj.play,
     )
@@ -1327,7 +1408,10 @@ def _project_kicker(proj, history, usage, env, ctx, wind_mult) -> None:
     team_fga = env["expected_team_fgs"]
     # Blend the team's structural expectation with the kicker's own recent volume; the kicker is
     # the only one taking his team's attempts, so the two are measuring the same thing.
-    fg_attempts = 0.5 * team_fga * fga_mult + 0.5 * fga_base.mean * fga_mult
+    # Held out, the kicker's own trailing FGA adds ~nothing once the implied-total model is in, and
+    # because the board selects on recent volume an equal-weight blend projected the ranked class
+    # 11-18% high. The kicker term is kept as a light shrinkage only.
+    fg_attempts = (KICKER_OWN_WEIGHT * fga_base.mean + (1 - KICKER_OWN_WEIGHT) * team_fga) * fga_mult
     attempt_steps = [
         MathStep("5.3 environment", "team expected FG attempts", team_fga),
         MathStep("5.1 baseline", "kicker recent FG attempts", fga_base.mean, f"{fga_base.n_games} games"),
@@ -1393,9 +1477,13 @@ def _project_lb(proj, history, usage, env, ctx, wind_mult) -> None:
 
     # Tackle opportunities scale with the opponent's RUN rate as well as its play count: a
     # pass-heavy opponent is bearish for box linebackers even at the same volume.
-    rush_rate = 1.0 - opp_env["expected_pass_rate"]
-    league_rush_rate = 0.43
-    rush_factor = float(np.clip(rush_rate / league_rush_rate, 0.75, 1.3))
+    # Centre on the league's actual expected rush rate this week, and use the measured
+    # elasticity of tackles to opponent rush rate (~0.2), not 1.0. The old 0.43 centre with unit
+    # elasticity mis-scaled every LB by up to 20% and only looked right in aggregate because its
+    # mean happened to offset a regression-to-mean over-projection.
+    rush_rate = 1.0 - float(opp_env["expected_pass_rate"] or 0.6)
+    league_rush_rate = float(np.mean([1.0 - (e["expected_pass_rate"] or 0.6) for e in ctx.environment.values()]) or 0.40)
+    rush_factor = float(np.clip((rush_rate / league_rush_rate) ** LB_RUSH_ELASTICITY, 0.85, 1.15))
 
     base = _baseline_for(history, "tackles_assists", ctx.season)
     tackles = base.mean * plays_mult * rush_factor
@@ -1500,10 +1588,41 @@ def _add_unconditional(proj: PlayerProjection) -> None:
                 new = fit_poisson(mean, unit=unit)
             else:
                 new = fit_negative_binomial(max(mean, 1e-6), max(var, mean * 1.05))
+        elif dist.family is Family.DETERMINISTIC and p < 0.999:
+            # Mixture: with probability 1-p he does not play and scores 0.
+            support = list(dist.params["support"])
+            probs = [float(x) * p for x in dist.params["probs"]]
+            if 0.0 in support:
+                probs[support.index(0.0)] += 1.0 - p
+            else:
+                support.insert(0, 0.0)
+                probs.insert(0, 1.0 - p)
+            mean = float(sum(v * q for v, q in zip(support, probs, strict=True)))
+            new = Distribution(
+                family=Family.DETERMINISTIC,
+                params={**dist.params, "support": support, "probs": probs, "mean": mean,
+                        "play_probability": p},
+                mean=mean, integer_valued=dist.integer_valued,
+            )
+        elif dist.family is Family.EMPIRICAL_MAX and p < 0.999:
+            # Mixture over the thinned samples: a (1-p) share of zeros joins the draws.
+            samples = np.asarray(dist.params.get("samples_sorted") or [], dtype=float)
+            if samples.size:
+                n_zero = int(round(samples.size * (1.0 - p) / max(p, 1e-6)))
+                mixed = np.sort(np.concatenate([samples, np.zeros(n_zero)]))
+                qs = {str(q): float(np.quantile(mixed, q)) for q in (0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95)}
+                thinned = mixed[np.linspace(0, mixed.size - 1, min(200, mixed.size)).astype(int)]
+                new = Distribution(
+                    family=Family.EMPIRICAL_MAX,
+                    params={**dist.params, "quantiles": qs,
+                            "p_zero": 1.0 - p * (1.0 - float(dist.params.get("p_zero", 0.0))),
+                            "samples_sorted": [float(x) for x in thinned], "play_probability": p},
+                    mean=float(mixed.mean()), integer_valued=False,
+                    notes=(*dist.notes, "unconditional: absence adds a point mass at 0"),
+                )
+            else:
+                new = dist
         else:
-            # Monte Carlo and deterministic families are already distributions over outcomes;
-            # scaling their parameters is not meaningful, so they carry through unchanged and are
-            # labelled as conditional.
             new = dist
 
         steps = [

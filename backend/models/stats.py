@@ -91,6 +91,11 @@ class StatSpec:
     settlement_note: str = ""
     derived_from: tuple[str, ...] = field(default_factory=tuple)
 
+    projected: bool = True
+    """False for a stat carried only as a DENOMINATOR (an RB's targets). It is written to the
+    adjusted game log so per-target rates can be computed, but never projected or displayed.
+    Without it every RB's catch rate and yards-per-target fell to the league prior with 0 games."""
+
 
 # ---------------------------------------------------------------------------
 # The registry (D9). Order within a position is the UI's display order.
@@ -112,7 +117,7 @@ STAT_SPECS: tuple[StatSpec, ...] = (
     StatSpec("completions", "Completions", _QB, Family.NEGATIVE_BINOMIAL, Aggregation.VOLUME,
              "completions", "completion_rate_allowed"),
     StatSpec("passing_yards", "Passing yards", _QB, Family.NEGATIVE_BINOMIAL, Aggregation.EFFICIENCY,
-             "passing_yards", "pass_yards_allowed", integer_valued=False,
+             "passing_yards", "pass_yards_per_attempt_allowed", integer_valued=False,
              settlement_note="Official passing yards, overtime included."),
     StatSpec("passing_tds", "Passing TDs", _QB, Family.POISSON, Aggregation.SCORING,
              "passing_tds", "pass_td_rate_allowed",
@@ -123,7 +128,7 @@ STAT_SPECS: tuple[StatSpec, ...] = (
     StatSpec("rush_attempts", "Rush attempts", _QB, Family.NEGATIVE_BINOMIAL, Aggregation.VOLUME,
              "carries", "rush_volume_allowed"),
     StatSpec("rushing_yards", "Rushing yards", _QB, Family.NEGATIVE_BINOMIAL, Aggregation.EFFICIENCY,
-             "rushing_yards", "rush_yards_allowed", integer_valued=False,
+             "rushing_yards", "rush_yards_per_carry_allowed", integer_valued=False,
              settlement_note="QB rushing yards count only toward QB rushing props."),
     StatSpec("longest_completion", "Longest completion", _QB, Family.EMPIRICAL_MAX,
              Aggregation.EFFICIENCY, None, "explosive_pass_allowed", integer_valued=False,
@@ -135,6 +140,8 @@ STAT_SPECS: tuple[StatSpec, ...] = (
     StatSpec("rush_attempts", "Rush attempts", _RB, Family.NEGATIVE_BINOMIAL, Aggregation.VOLUME,
              "carries", "rush_volume_allowed",
              settlement_note="Kneel-downs count as negative rushing attempts."),
+    StatSpec("targets", "Targets", _RB, Family.NEGATIVE_BINOMIAL, Aggregation.VOLUME,
+             "targets", "rec_volume_allowed_rb", projected=False),
     StatSpec("rushing_yards", "Rushing yards", _RB, Family.NEGATIVE_BINOMIAL, Aggregation.EFFICIENCY,
              "rushing_yards", "rush_yards_allowed_rb", integer_valued=False),
     StatSpec("receptions", "Receptions", _RB, Family.NEGATIVE_BINOMIAL, Aggregation.VOLUME,
@@ -229,9 +236,14 @@ _BY_KEY: dict[tuple[Position, str], StatSpec] = {
 }
 
 
-def stats_for(position: Position | str) -> tuple[StatSpec, ...]:
-    """Every stat PropLab projects for a position, in display order."""
-    return STATS_BY_POSITION[Position(position)]
+def stats_for(position: Position | str, include_denominators: bool = False) -> tuple[StatSpec, ...]:
+    """Every stat PropLab projects for a position, in display order.
+
+    ``include_denominators`` adds the denominator-only stats (an RB's targets), which the adjusted
+    game log needs and nothing user-facing should show.
+    """
+    specs = STATS_BY_POSITION[Position(position)]
+    return specs if include_denominators else tuple(s for s in specs if s.projected)
 
 
 def get_spec(position: Position | str, key: str) -> StatSpec:

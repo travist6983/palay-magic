@@ -131,6 +131,7 @@ def refresh(force: bool = False) -> list[StageResult]:
     ]
 
     stages += _model_stages(state.season, state.week)
+    stages.append(_run("simulate.joint", _simulate_stage, state.season, state.week))
     stages.append(_run("llm.notes", _llm_stage, state.season, state.week))
     _record_refresh(state, stages)
 
@@ -139,6 +140,13 @@ def refresh(force: bool = False) -> list[StageResult]:
 
     stages.append(_run("publish", publish_snapshot))
     return stages
+
+
+def _simulate_stage(season: int, week: int):
+    """Joint simulation after the projections, so the served draws never predate them (§5.8)."""
+    from backend.models.simulate import run_simulation
+
+    return run_simulation(season, week, n_sims=2500)
 
 
 def _llm_stage(season: int, week: int):
