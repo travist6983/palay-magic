@@ -181,6 +181,31 @@ def variance_at(mean: float, alpha: float, scale: float = 1.0) -> float:
     return max((mean + alpha * mean * mean) * scale, mean * 1.05)
 
 
+_BIAS_CACHE: dict[tuple[str, str], float] | None = None
+
+
+def bias_ratio(position: str, stat: str) -> float:
+    """The held-out mean correction for this cell (§6, migration 014). 1.0 until calibrated."""
+    global _BIAS_CACHE
+    if _BIAS_CACHE is None:
+        try:
+            with connect() as con:
+                rows = con.execute("SELECT position, stat, ratio FROM bias_calibration").fetchall()
+            _BIAS_CACHE = {(p, s): float(v) for p, s, v in rows}
+        except Exception:  # noqa: BLE001 - table may not exist yet
+            _BIAS_CACHE = {}
+    return _BIAS_CACHE.get((position, stat), 1.0)
+
+
+def _apply_bias(position: str, stat: str, mean: float, steps: list) -> float:
+    """Multiply the modelled mean by its calibrated ratio and record the step."""
+    ratio = bias_ratio(position, stat)
+    if abs(ratio - 1.0) > 1e-6:
+        steps.append(MathStep("6 calibration", "held-out mean correction", ratio,
+                              "actual / projected on the fit season, shrunk toward 1"))
+    return mean * ratio
+
+
 def dispersion_scale(position: str, stat: str) -> float:
     """The empirically calibrated variance multiplier for this cell (§6, migration 010).
 
@@ -724,7 +749,9 @@ def _passing_td_share(team: str, ctx: ProjectionContext, player_pass_tds: float)
 
 
 def _scaled_poisson(position: str, stat: str, lam: float, steps: list[MathStep]) -> Distribution:
-    """A Poisson whose width has been calibrated (§6). Above scale 1 it becomes a neg-binomial."""
+    """A Poisson whose centre and width have been calibrated (§6). Above scale 1 it becomes a
+    negative binomial; a scale below 1 cannot narrow a Poisson and is a no-op."""
+    lam = _apply_bias(position, stat, lam, steps)
     scale = dispersion_scale(position, stat)
     if abs(scale - 1.0) < 1e-6:
         return fit_poisson(lam)
@@ -817,6 +844,7 @@ def _count_projection(
     play: PlayProbability,
 ) -> StatProjection:
     """Fit a count stat, transporting the player's own over-dispersion to the projected mean."""
+    mean = _apply_bias(position, stat, mean, steps)
     base = _baseline_for(history, stat, ctx.season)
     if base.n_games >= get_settings().recency_window and base.mean > 0:
         alpha = alpha_from_moments(base.mean, base.variance)
@@ -846,6 +874,7 @@ def _yardage_projection(
     play: PlayProbability,
 ) -> StatProjection:
     """Fit a yardage stat as a negative binomial (§5.6)."""
+    mean = _apply_bias(position, stat, mean, steps)
     base = _baseline_for(history, stat, ctx.season)
     if base.n_games >= get_settings().recency_window and base.mean > 0:
         alpha = alpha_from_moments(base.mean, base.variance)

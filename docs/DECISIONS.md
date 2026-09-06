@@ -308,3 +308,22 @@ live 2026 Week 1 had been built on those. Every replay now ends by refitting on 
 | kick-return TDs credited to the offence | excluded | nflverse sets posteam to the receiving team on kickoffs |
 | kneels and scrambles in the explosive-rush denominator | excluded | kneel share of carries faced ranges 0.75–7.1% across defences |
 | `redistribute_target_share` defined, never called | called; the position's slice split among healthy peers | an Out WR1 moved nobody; the first wiring handed the whole slice to *each* WR and put targets +2.6 |
+
+## D23. A held-out mean-bias correction was tried and rejected
+
+After the review fixes, the remaining errors were level errors of a few percent. The obvious
+remedy is a multiplicative correction per (position, stat) fitted on one season's replay, the
+same mechanism the interval widths use. It was built (`proplab calibrate-bias`, migration 014)
+and it fails validation:
+
+| Stat | 2025 bias before | with 2024-fitted ratio |
+|---|---|---|
+| targets | +1.05 | +0.53 |
+| rushing yards | −0.05 | **+4.61** |
+| passing yards | +2.74 | **+4.85** |
+| coverage | 58.6% | 60.7% |
+
+The ratios that hurt (QB rushing yards ×1.07, passing yards ×1.05) were fitting 2024's noise, not
+a structural bias. The command is kept as a diagnostic; the table is empty in production and
+`make calibrate` does not run it. The honest position is that a few percent of level error is
+the model's floor with this data, and the intervals already price it.

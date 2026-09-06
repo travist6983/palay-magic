@@ -217,6 +217,28 @@ def project(
         print_projection(player, season, week)
 
 
+@app.command(name="calibrate-bias")
+def calibrate_bias_cmd(
+    season: Annotated[int, typer.Option(help="Season to FIT on; use a different one to report")] = 2024,
+    weeks: Annotated[str, typer.Option()] = "5-18",
+    reuse_run: Annotated[str, typer.Option(help="Score an existing run id instead of replaying")] = "",
+) -> None:
+    """Fit the per-stat mean correction on a training season (§6)."""
+    from backend.models.backtest import calibrate_bias
+
+    lo, hi = (int(x) for x in weeks.split("-", 1)) if "-" in weeks else (int(weeks), int(weeks))
+    frame = calibrate_bias(season, list(range(lo, hi + 1)), reuse_run or None)
+    if frame.is_empty():
+        console.print("[yellow]nothing to calibrate[/yellow]")
+        return
+    table = Table("position", "stat", "ratio", "n", "projected", "actual",
+                  title=f"Mean-bias calibration (fitted on {season} weeks {lo}-{hi})")
+    for r in frame.to_dicts():
+        table.add_row(r["position"], r["stat"], f"{r['ratio']:.3f}", str(r["n"]),
+                      f"{r['projected_mean']:.2f}", f"{r['actual_mean']:.2f}")
+    console.print(table)
+
+
 @app.command(name="calibrate-dispersion")
 def calibrate_dispersion_cmd(
     season: Annotated[int, typer.Option(help="Season to FIT on; use a different one to report")] = 2024,

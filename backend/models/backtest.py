@@ -210,6 +210,7 @@ def _refit_on(seasons: list[int]) -> None:
     train seasons and never put the production versions back; 2026 Week 1 was quietly built on
     2023-24-only ridge penalties and environment coefficients.
     """
+    from backend.models import project as project_module
     from backend.models.adjust import calibrate_metrics
     from backend.models.environment import fit_environment_models
     from backend.models.injury import compute_play_rates
@@ -223,6 +224,8 @@ def _refit_on(seasons: list[int]) -> None:
 
     _DISPERSION_CACHE.clear()
     _RATE_PRIOR_CACHE.clear()
+    project_module._DISPERSION_SCALE_CACHE = None
+    project_module._BIAS_CACHE = None
     calibrate_metrics(seasons)
     fit_environment_models(seasons)
     fit_td_share_models(seasons)
@@ -298,6 +301,93 @@ def _solve_scale(rows: list[dict[str, Any]], target: float = 0.5) -> tuple[float
             hi = mid
     scale = (lo + hi) / 2
     return scale, before, _central_coverage(rows, scale)
+
+
+# Shrinkage on the bias ratio: a cell with n rows gets weight n / (n + BIAS_PRIOR_ROWS) on its
+# own ratio and the rest on 1.0, so a thin cell cannot swing a projection on noise.
+BIAS_PRIOR_ROWS = 60
+BIAS_RATIO_BOUNDS = (0.7, 1.4)
+
+
+def calibrate_bias(
+    season: int = 2024,
+    weeks: list[int] | None = None,
+    reuse_run: str | None = None,
+) -> pl.DataFrame:
+    """Fit a multiplicative mean correction per (position, stat) from a replay (§6).
+
+    ``ratio = actual mean / projected mean`` on the fit season, shrunk toward 1.0 by cell size and
+    bounded. Applied in ``project.py`` to the mean BEFORE the distribution is fitted, so the width
+    calibration sees the corrected centre. Fit on one season and validate on another -- a ratio
+    fitted on the rows it is scored against would read unbiased by construction.
+
+    Binary and Monte Carlo stats are excluded: anytime TD has its own fitted share model, and the
+    longest-X family is bootstrapped from real plays.
+
+    **Not applied in production.** Fitted on 2024 and scored on 2025 it made the two largest
+    yardage stats worse (rushing yards -0.05 -> +4.6, passing yards +2.7 -> +4.9) while helping
+    targets, and pushed interval coverage to the edge of the gate. The residual level errors are
+    not stable season to season, so the ratios were fitting one season's noise. The command stays
+    as a diagnostic; ``make calibrate`` does not run it and the table is empty (D23).
+    """
+    weeks = weeks or list(range(5, 19))
+    if reuse_run:
+        run_id = reuse_run
+    else:
+        log.info("replaying %s weeks %s-%s to fit mean bias", season, min(weeks), max(weeks))
+        run_backtest(season=season, weeks=weeks, refit=True, quiet=True)
+        run_id = latest_run()
+
+    with connect() as con:
+        df = con.execute(
+            """
+            SELECT position, stat, count(*) AS n,
+                   avg(json_extract(params, '$.mean')::DOUBLE) AS projected_mean,
+                   avg(actual) AS actual_mean
+            FROM backtest_results
+            WHERE run_id = ? AND dist_family IN ('negative_binomial', 'poisson')
+            GROUP BY 1, 2
+            """,
+            [run_id],
+        ).pl()
+
+    if df.is_empty():
+        log.warning("no rows to calibrate bias from")
+        return pl.DataFrame()
+
+    label = f"{season} weeks {min(weeks)}-{max(weeks)}"
+    rows = []
+    for r in df.to_dicts():
+        proj, act, n = float(r["projected_mean"] or 0.0), float(r["actual_mean"] or 0.0), int(r["n"])
+        raw = act / proj if proj > 0 else 1.0
+        w = n / (n + BIAS_PRIOR_ROWS)
+        ratio = float(np.clip(w * raw + (1 - w) * 1.0, *BIAS_RATIO_BOUNDS))
+        rows.append(
+            {"position": r["position"], "stat": r["stat"], "ratio": ratio, "n": n,
+             "projected_mean": proj, "actual_mean": act, "fitted_on": label}
+        )
+
+    frame = pl.DataFrame(rows)
+    with connect() as con:
+        con.register("bias_df", frame)
+        try:
+            con.execute("BEGIN TRANSACTION")
+            con.execute("DELETE FROM bias_calibration")
+            con.execute(
+                "INSERT INTO bias_calibration "
+                "(position, stat, ratio, n, projected_mean, actual_mean, fitted_on, computed_at) "
+                "SELECT position, stat, ratio, n, projected_mean, actual_mean, fitted_on, now() "
+                "FROM bias_df"
+            )
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        finally:
+            con.unregister("bias_df")
+
+    log.info("mean bias calibrated for %d cells on %s", frame.height, label)
+    return frame.sort("ratio")
 
 
 def calibrate_dispersion(

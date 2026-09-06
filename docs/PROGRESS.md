@@ -178,6 +178,20 @@ independent product.
 
 ---
 
+## Review pass (2026-09-06)
+
+A review of the equations found 19 defects; all fixed (D16–D22). A held-out mean-bias
+correction was then tried and rejected because it failed validation (D23).
+
+Held-out 2025 weeks 5–18 after the fixes: **p25–p75 coverage 59.0%, PIT central mass 51.6%**
+(gate 40–60%). Anytime-TD calibration, the most-bet market: RB bias +11.4pp → −1.1pp, QB rush
++14.6 → +8.4, TE −13.3 → −12.4, WR +0.5 → +4.8. The honest matchup numbers are now much smaller
+(best defensive signal 5.9% MSE reduction; WR/RB yards-per-target allowed pinned to neutral as
+no-signal).
+
+Residual level errors of a few percent remain (rushing yards +2.2, passing yards −7.1, targets
++0.8 on 2025) and are not stable enough across seasons to correct — see D23.
+
 ## Where the model is weak
 
 Stated plainly, because these are the things that would mislead someone reading a number:

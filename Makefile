@@ -30,7 +30,7 @@ project: ## Project one player: make project PLAYER="Player Name"
 backtest: ## Score last season's projections against actuals
 	$(UV) run proplab backtest --season 2025 --weeks 5-18
 
-calibrate: ## Re-tune the opponent-adjustment model and the projection interval widths
+calibrate: ## Re-tune the opponent model and the interval widths (fitted on 2024, validated on 2025)
 	$(UV) run proplab calibrate
 	$(UV) run proplab calibrate-dispersion --season 2024 --weeks 5-18
 
